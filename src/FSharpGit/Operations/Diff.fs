@@ -8,87 +8,45 @@ module Diff =
         TreeOperations.treeToMap repo tree
     
     let rec private diffTreesInternal (entries1: TreeEntry[]) (entries2: TreeEntry[]) (path: string) (repo: Repo) (changes: ResizeArray<FileChange>) : Result<ResizeArray<FileChange>, string> =
-        let map1 = entries1 |> Array.map (fun e -> (e.Path, e)) |> dict
-        let map2 = entries2 |> Array.map (fun e -> (e.Path, e)) |> dict
-        
-        let allPaths = 
-            [| entries1 |> Array.map (fun e -> e.Path)
-               entries2 |> Array.map (fun e -> e.Path) |]
-            |> Array.concat
+        let map1 = entries1 |> Array.map (fun e -> e.Path, e) |> dict
+        let map2 = entries2 |> Array.map (fun e -> e.Path, e) |> dict
+        let names =
+            Array.append (entries1 |> Array.map (fun e -> e.Path)) (entries2 |> Array.map (fun e -> e.Path))
             |> Array.distinct
-        
-        for path in allPaths do
-            let exists1 = map1.ContainsKey path
-            let exists2 = map2.ContainsKey path
-            
-            if exists1 && exists2 then
-                let entry1 = map1.[path]
-                let entry2 = map2.[path]
-                
-                if entry1.Hash <> entry2.Hash then
-                    let changeType = 
-                        if entry1.Mode <> entry2.Mode then
-                            Modified
-                        else
-                            Modified
-                    
-                    changes.Add {
-                        Path = path
-                        OldHash = Some entry1.Hash
-                        NewHash = Some entry2.Hash
-                        ChangeType = changeType
-                    }
-                
-                if entry1.Mode &&& 0o40000 <> 0 || entry2.Mode &&& 0o40000 <> 0 then
-                    match TreeOperations.listTree repo entry1.Hash, TreeOperations.listTree repo entry2.Hash with
-                    | Ok tree1, Ok tree2 ->
-                        let newPath = if System.String.IsNullOrEmpty path then path else $"{path}/"
-                        let fullEntries1 = tree1 |> Array.map (fun (e: TreeEntry) -> { e with Path = $"{newPath}{e.Path}" })
-                        let fullEntries2 = tree2 |> Array.map (fun (e: TreeEntry) -> { e with Path = $"{newPath}{e.Path}" })
-                        match diffTreesInternal fullEntries1 fullEntries2 newPath repo changes with
-                        | Ok _ -> ()
-                        | Error msg -> Error msg |> ignore
-                    | Error msg, _ -> Error msg |> ignore
-                    | _, Error msg -> Error msg |> ignore
-            elif exists1 && not exists2 then
-                let entry1 = map1.[path]
-                
-                if entry1.Mode &&& 0o40000 <> 0 then
-                    match TreeOperations.listTree repo entry1.Hash with
-                    | Ok tree1 ->
-                        let newPath = if System.String.IsNullOrEmpty path then path else $"{path}/"
-                        let fullEntries1 = tree1 |> Array.map (fun (e: TreeEntry) -> { e with Path = $"{newPath}{e.Path}" })
-                        match diffTreesInternal fullEntries1 [||] newPath repo changes with
-                        | Ok _ -> ()
-                        | Error msg -> Error msg |> ignore
-                    | Error msg -> Error msg |> ignore
-                else
-                    changes.Add {
-                        Path = path
-                        OldHash = Some entry1.Hash
-                        NewHash = None
-                        ChangeType = Deleted
-                    }
-            elif not exists1 && exists2 then
-                let entry2 = map2.[path]
-                
-                if entry2.Mode &&& 0o40000 <> 0 then
-                    match TreeOperations.listTree repo entry2.Hash with
-                    | Ok tree2 ->
-                        let newPath = if System.String.IsNullOrEmpty path then path else $"{path}/"
-                        let fullEntries2 = tree2 |> Array.map (fun (e: TreeEntry) -> { e with Path = $"{newPath}{e.Path}" })
-                        match diffTreesInternal [||] fullEntries2 newPath repo changes with
-                        | Ok _ -> ()
-                        | Error msg -> Error msg |> ignore
-                    | Error msg -> Error msg |> ignore
-                else
-                    changes.Add {
-                        Path = path
-                        OldHash = None
-                        NewHash = Some entry2.Hash
-                        ChangeType = Added
-                    }
-        
+        let isTree (e: TreeEntry) = e.Mode &&& 0o40000 <> 0
+        let full (name: string) = if System.String.IsNullOrEmpty path then name else $"{path}/{name}"
+        // Recurse into a subtree present on one or both sides. Only leaf (blob)
+        // differences are emitted; directories themselves are never reported,
+        // matching `git diff`.
+        let recurseSub (h1: GitHash option) (h2: GitHash option) (name: string) =
+            let load (h: GitHash option) =
+                match h with
+                | Some hh -> (match TreeOperations.listTree repo hh with Ok es -> es | Error _ -> [||])
+                | None -> [||]
+            diffTreesInternal (load h1) (load h2) (full name) repo changes |> ignore
+        for name in names do
+            let e1 = if map1.ContainsKey name then Some map1.[name] else None
+            let e2 = if map2.ContainsKey name then Some map2.[name] else None
+            match e1, e2 with
+            | Some a, Some b when a.Hash = b.Hash && a.Mode = b.Mode -> ()
+            | Some a, Some b ->
+                match isTree a, isTree b with
+                | true, true -> recurseSub (Some a.Hash) (Some b.Hash) name
+                | false, false ->
+                    changes.Add { Path = full name; OldHash = Some a.Hash; NewHash = Some b.Hash; ChangeType = Modified }
+                | true, false ->
+                    recurseSub (Some a.Hash) None name
+                    changes.Add { Path = full name; OldHash = None; NewHash = Some b.Hash; ChangeType = Added }
+                | false, true ->
+                    changes.Add { Path = full name; OldHash = Some a.Hash; NewHash = None; ChangeType = Deleted }
+                    recurseSub None (Some b.Hash) name
+            | Some a, None ->
+                if isTree a then recurseSub (Some a.Hash) None name
+                else changes.Add { Path = full name; OldHash = Some a.Hash; NewHash = None; ChangeType = Deleted }
+            | None, Some b ->
+                if isTree b then recurseSub None (Some b.Hash) name
+                else changes.Add { Path = full name; OldHash = None; NewHash = Some b.Hash; ChangeType = Added }
+            | None, None -> ()
         Ok changes
     
     let diffTrees (repo: Repo) (oldTree: GitHash) (newTree: GitHash) : Result<FileChange[], string> =
