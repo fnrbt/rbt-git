@@ -18,13 +18,41 @@ module ReadObjects =
         with
         | ex -> Error $"Failed to read loose object {hash}: {ex.Message}"
     
+    /// Reconstruct a parsed object from a raw (type, content) pair.
+    let private parseRaw (t: string) (content: byte[]) : Result<GitObject, string> =
+        let header = System.Text.Encoding.UTF8.GetBytes(sprintf "%s %d\000" t content.Length)
+        ObjectParser.parseObject (Array.append header content)
+
     let readObject (repo: Repo) (hash: GitHash) : Result<GitObject, string> =
         match tryReadLooseObject repo hash with
         | Ok obj -> Ok obj
         | Error _ ->
-            match PackParser.findPackObject repo hash with
-            | Ok (obj, _) -> Ok obj
-            | Error msg -> Error msg
+            match PackStore.tryRead repo hash with
+            | Some (t, content) -> parseRaw t content
+            | None -> Error $"Object not found: {hash}"
+
+    /// Read an object's exact (typeName, contentBytes) without parsing, so the
+    /// bytes can be re-served or re-packed with an identical hash. Loose objects
+    /// preserve their bytes exactly; packed objects fall back to canonical
+    /// re-serialization (byte-exact for well-formed objects).
+    let readRawObject (repo: Repo) (hash: GitHash) : Result<string * byte[], string> =
+        try
+            let objectPath = Repository.getLooseObjectPath repo hash
+            if File.Exists objectPath then
+                let decompressed = Compression.decompress (File.ReadAllBytes objectPath)
+                let nul = System.Array.IndexOf(decompressed, 0uy)
+                if nul < 0 then Error $"Invalid object (no header null): {hash}"
+                else
+                    let header = System.Text.Encoding.UTF8.GetString(decompressed, 0, nul)
+                    let sp = header.IndexOf(' ')
+                    let objType = if sp < 0 then header else header.Substring(0, sp)
+                    let content = decompressed.[nul + 1 ..]
+                    Ok (objType, content)
+            else
+                match PackStore.tryRead repo hash with
+                | Some raw -> Ok raw
+                | None -> Error $"Object not found: {hash}"
+        with ex -> Error $"Failed to read raw object {hash}: {ex.Message}"
     
     let readBlob (repo: Repo) (hash: GitHash) : Result<byte[], string> =
         match readObject repo hash with
@@ -51,13 +79,7 @@ module ReadObjects =
         | Error msg -> Error msg
     
     let objectExists (repo: Repo) (hash: GitHash) : bool =
-        let objectPath = Repository.getLooseObjectPath repo hash
-        if File.Exists objectPath then
-            true
-        else
-            match PackParser.findPackObject repo hash with
-            | Ok _ -> true
-            | _ -> false
+        File.Exists (Repository.getLooseObjectPath repo hash) || PackStore.exists repo hash
     
     let private objectCache = System.Collections.Concurrent.ConcurrentDictionary<Repo * GitHash, GitObject>()
     

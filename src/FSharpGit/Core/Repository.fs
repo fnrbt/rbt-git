@@ -47,15 +47,15 @@ module Repository =
         | ex -> Error $"Failed to open repository: {ex.Message}"
     
     let gitPath (repo: Repo) (segments: string[]) : string =
-        Path.Combine([| repo.GitDir |] |> Array.append segments)
-    
+        Path.Combine(Array.append [| repo.GitDir |] segments)
+
     let hasWorkTree (repo: Repo) : bool =
         Option.isSome repo.WorkTree
-    
+
     let workTreePath (repo: Repo) (segments: string[]) : string =
         match repo.WorkTree with
-        | Some wt -> Path.Combine([| wt |] |> Array.append segments)
-        | None -> 
+        | Some wt -> Path.Combine(Array.append [| wt |] segments)
+        | None ->
             raise (NotSupportedException "Bare repository does not have a working tree")
     
     let isBare (repo: Repo) : bool =
@@ -120,3 +120,26 @@ module Repository =
     
     let remoteBranchFilePath (repo: Repo) (remote: string) (branch: string) : string =
         Path.Combine(getRemotesDir repo, remote, branch)
+
+    /// Open an existing bare repository (the directory itself is the git dir).
+    let openBare (path: string) : Result<Repo, string> =
+        let full = Path.GetFullPath path
+        if Directory.Exists full && File.Exists (Path.Combine(full, "HEAD")) then
+            Ok { Path = full; GitDir = full; WorkTree = None }
+        else
+            Error $"Not a bare repository: {path}"
+
+    /// Initialize a new empty bare repository at the given path. Default branch is `main`.
+    let initBare (path: string) : Result<Repo, string> =
+        try
+            let full = Path.GetFullPath path
+            Directory.CreateDirectory full |> ignore
+            Directory.CreateDirectory (Path.Combine(full, "objects", "pack")) |> ignore
+            Directory.CreateDirectory (Path.Combine(full, "refs", "heads")) |> ignore
+            Directory.CreateDirectory (Path.Combine(full, "refs", "tags")) |> ignore
+            File.WriteAllText(Path.Combine(full, "HEAD"), "ref: refs/heads/main\n")
+            File.WriteAllText(
+                Path.Combine(full, "config"),
+                "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n")
+            Ok { Path = full; GitDir = full; WorkTree = None }
+        with ex -> Error $"Failed to init bare repository: {ex.Message}"

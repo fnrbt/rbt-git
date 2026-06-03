@@ -63,8 +63,10 @@ module PackParser =
     let readPackIndex (path: string) : Result<PackIndex, string> =
         try
             use stream = File.OpenRead path
-            let signature = Encoding.UTF8.GetString(readBytes stream 4)
-            if signature <> "\xFFtOc" then
+            // Magic is the raw bytes FF 74 4F 63 ("\377tOc"); compare bytes, not a
+            // UTF-8 decode (0xFF is not valid UTF-8 and would never match).
+            let sigBytes = readBytes stream 4
+            if not (sigBytes.[0] = 0xFFuy && sigBytes.[1] = 0x74uy && sigBytes.[2] = 0x4Fuy && sigBytes.[3] = 0x63uy) then
                 Error "Invalid pack index signature"
             else
                 let version = readUInt32BE stream |> int
@@ -87,13 +89,13 @@ module PackParser =
                 for i in 0 .. totalObjects - 1 do
                     offsets.[i] <- readUInt32BE stream |> int64
                 
+                // The 8-byte large-offset table is present only when some 4-byte
+                // offset has its MSB set (offset >= 2GiB). It has no count field;
+                // there is one entry per MSB-set offset, in order.
                 let largeOffsets = System.Collections.Generic.Dictionary<int32, int64>()
-                if int64 stream.Position + 8L <= stream.Length then
-                    let largeOffsetCount = readUInt32BE stream |> int
-                    for _ in 0 .. largeOffsetCount - 1 do
-                        let index = readUInt32BE stream |> int
-                        let offset = readUInt64BE stream |> int64
-                        largeOffsets.[index] <- offset
+                let largeCount = offsets |> Array.filter (fun o -> o &&& 0x80000000L <> 0L) |> Array.length
+                for k in 0 .. largeCount - 1 do
+                    largeOffsets.[k] <- readUInt64BE stream |> int64
                 
                 let objects = Array.zeroCreate totalObjects
                 for i in 0 .. totalObjects - 1 do

@@ -14,14 +14,23 @@
     <Compile Include="Core\References.fs" />
     <Compile Include="Parsing\ObjectParser.fs" />
     <Compile Include="Parsing\PackParser.fs" />
+    <Compile Include="Parsing\PackData.fs" />
+    <Compile Include="Operations\PackStore.fs" />
     <Compile Include="Parsing\IndexParser.fs" />
+    <Compile Include="Operations\ObjectWriter.fs" />
     <Compile Include="Operations\ReadObjects.fs" />
+    <Compile Include="Operations\Gc.fs" />
+    <Compile Include="Operations\PackWriter.fs" />
     <Compile Include="Operations\CommitHistory.fs" />
+    <Compile Include="Operations\Merge3.fs" />
     <Compile Include="Operations\TreeOperations.fs" />
     <Compile Include="Operations\Diff.fs" />
     <Compile Include="Operations\Merge.fs" />
     <Compile Include="Operations\Remote.fs" />
     <Compile Include="Operations\RepositoryOperations.fs" />
     <Compile Include="Utilities\PathUtils.fs" />
+    <Compile Include="Protocol\PktLine.fs" />
+    <Compile Include="Operations\PackStream.fs" />
+    <Compile Include="Protocol\SmartHttp.fs" />
   </ItemGroup>
 </Project>
