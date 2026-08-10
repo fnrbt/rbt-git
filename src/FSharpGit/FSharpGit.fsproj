@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RootNamespace>FSharpGit</RootNamespace>
+    <AssemblyName>FSharpGit</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Core\Types.fs" />
+    <Compile Include="Utilities\Hashing.fs" />
+    <Compile Include="Utilities\Compression.fs" />
+    <Compile Include="Core\Repository.fs" />
+    <Compile Include="Core\GitConfig.fs" />
+    <Compile Include="Core\References.fs" />
+    <Compile Include="Parsing\ObjectParser.fs" />
+    <Compile Include="Parsing\PackParser.fs" />
+    <Compile Include="Parsing\PackData.fs" />
+    <Compile Include="Operations\PackStore.fs" />
+    <Compile Include="Parsing\IndexParser.fs" />
+    <Compile Include="Operations\ObjectWriter.fs" />
+    <Compile Include="Operations\ReadObjects.fs" />
+    <Compile Include="Operations\Fsck.fs" />
+    <Compile Include="Operations\Gc.fs" />
+    <Compile Include="Operations\PackWriter.fs" />
+    <Compile Include="Operations\CommitHistory.fs" />
+    <Compile Include="Operations\Merge3.fs" />
+    <Compile Include="Operations\TreeOperations.fs" />
+    <Compile Include="Operations\Diff.fs" />
+    <Compile Include="Operations\Merge.fs" />
+    <Compile Include="Operations\RepositoryOperations.fs" />
+    <Compile Include="Utilities\PathUtils.fs" />
+    <Compile Include="Protocol\PktLine.fs" />
+    <Compile Include="Operations\PackStream.fs" />
+    <Compile Include="Protocol\SmartHttp.fs" />
+    <Compile Include="Operations\Remote.fs" />
+  </ItemGroup>
+</Project>
