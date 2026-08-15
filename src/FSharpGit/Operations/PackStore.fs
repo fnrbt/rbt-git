@@ -9,20 +9,20 @@ open System.IO
 /// ofs-deltas (within the pack) and ref-deltas (within the pack, or against
 /// loose objects / other packs for thin packs). Replaces the broken
 /// PackParser.findPackObject read path. Pack files are immutable once written
-/// (gc creates a uniquely named pack), so loaded packs are cached by path.
+/// (gc creates a uniquely named pack), so parsed indexes are cached by path.
+/// Pack contents remain on disk and are read through a bounded FileStream.
 module PackStore =
 
-    // packPath -> (packBytes, hash -> offset)
-    let private cache = ConcurrentDictionary<string, byte[] * Dictionary<GitHash, int>>()
+    // packPath -> hash -> offset
+    let private cache = ConcurrentDictionary<string, Dictionary<GitHash, int64>>()
 
-    let private loadPack (packPath: string) (idxPath: string) : byte[] * Dictionary<GitHash, int> =
+    let private loadIndex (packPath: string) (idxPath: string) : Dictionary<GitHash, int64> =
         cache.GetOrAdd(packPath, fun _ ->
-            let bytes = File.ReadAllBytes packPath
-            let map = Dictionary<GitHash, int>()
+            let map = Dictionary<GitHash, int64>()
             match PackParser.readPackIndex idxPath with
-            | Ok idx -> for o in idx.Objects do map.[o.Hash] <- int o.Offset
+            | Ok idx -> for o in idx.Objects do map.[o.Hash] <- o.Offset
             | Error _ -> ()
-            bytes, map)
+            map)
 
     let private tryLoose (repo: Repo) (hash: GitHash) : (string * byte[]) option =
         let path = Repository.getLooseObjectPath repo hash
@@ -45,13 +45,21 @@ module PackStore =
         while result.IsNone && i < packs.Length do
             let (name, packPath) = packs.[i]
             let idxPath = Repository.getPackIndexPath repo name
-            let bytes, map = loadPack packPath idxPath
+            let map = loadIndex packPath idxPath
             match map.TryGetValue hash with
             | true, off ->
+                use pack =
+                    new FileStream(
+                        packPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.Read,
+                        64 * 1024,
+                        FileOptions.RandomAccess)
                 // Resolve bases: ofs-delta by offset within THIS pack; ref-delta by
                 // hash within this pack, else loose / other packs (thin packs).
-                let rec byOff (o: int) : (string * byte[]) option =
-                    Some(PackData.readObjectAt bytes o byOff byHash)
+                let rec byOff (o: int64) : (string * byte[]) option =
+                    Some(PackData.readObjectAtStream pack o byOff byHash)
                 and byHash (h: GitHash) : (string * byte[]) option =
                     match map.TryGetValue h with
                     | true, o2 -> byOff o2
@@ -59,7 +67,7 @@ module PackStore =
                         match tryLoose repo h with
                         | Some r -> Some r
                         | None -> tryRead repo h
-                result <- Some(PackData.readObjectAt bytes off byOff byHash)
+                result <- Some(PackData.readObjectAtStream pack off byOff byHash)
             | _ -> ()
             i <- i + 1
         result

@@ -7,8 +7,8 @@ open System.Security.Cryptography
 
 /// Low-level packfile primitives shared by the pack writer, the unpacker, and
 /// the random-access pack reader: zlib inflate with exact byte accounting,
-/// git delta application, and object-header parsing. These are pure functions
-/// over an in-memory pack buffer.
+/// git delta application, and object-header parsing. Supports both in-memory
+/// buffers and seekable streams.
 module PackData =
 
     let typeName (n: int) =
@@ -248,6 +248,32 @@ module PackData =
         | 7 ->
             let baseHash = hashOf pack p1
             let delta, _ = inflateAt pack (p1 + 20) size
+            match resolveByHash baseHash with
+            | Some (bt, bc) -> bt, applyDelta bc delta
+            | None -> failwithf "ref-delta base not found: %s" baseHash
+        | other -> failwithf "unsupported pack object type %d" other
+
+    /// Random-access read from a seekable pack stream without loading the
+    /// complete pack into managed memory.
+    let rec readObjectAtStream
+        (pack: Stream) (start: int64)
+        (resolveByOffset: int64 -> (string * byte[]) option)
+        (resolveByHash: GitHash -> (string * byte[]) option) : string * byte[] =
+        pack.Position <- start
+        let typeId, size = readObjHeaderFromStream pack
+        match typeId with
+        | 1 | 2 | 3 | 4 ->
+            typeName typeId, inflateFromStream pack size
+        | 6 ->
+            let rel = readOfsBaseFromStream pack
+            let delta = inflateFromStream pack size
+            let baseOffset = start - int64 rel
+            match resolveByOffset baseOffset with
+            | Some (bt, bc) -> bt, applyDelta bc delta
+            | None -> failwithf "ofs-delta base not found at %d" baseOffset
+        | 7 ->
+            let baseHash = hashOf (readExact pack 20) 0
+            let delta = inflateFromStream pack size
             match resolveByHash baseHash with
             | Some (bt, bc) -> bt, applyDelta bc delta
             | None -> failwithf "ref-delta base not found: %s" baseHash
