@@ -82,6 +82,77 @@ module Fsck =
             }
         with ex -> Error $"Reachable fsck failed: {ex.Message}"
 
+    /// Verify objects introduced by a receive-pack without rescanning repository
+    /// history. Received objects and updated ref tips are parsed completely.
+    /// Pre-existing objects reached from them are existence-checked boundaries;
+    /// full historical verification belongs to fsck.
+    let verifyIntroduced
+        (repo: Repo)
+        (updatedTips: GitHash seq)
+        (introducedObjects: GitHash seq) : Result<FsckReport, string> =
+        try
+            let introduced = HashSet<GitHash>(introducedObjects, StringComparer.Ordinal)
+            let tips = updatedTips |> Seq.distinct |> Array.ofSeq
+            let issues = ResizeArray<FsckIssue>()
+            let checkedObjects = HashSet<GitHash>(StringComparer.Ordinal)
+            let objectTypes = Dictionary<GitHash, string>(StringComparer.Ordinal)
+            let pending = Stack<GitHash * string option * bool>()
+            for hash in introduced do pending.Push(hash, None, true)
+            for hash in tips do pending.Push(hash, None, true)
+
+            let checkExpectedType hash expectedType objectType =
+                match expectedType with
+                | Some expected when expected <> objectType ->
+                    issues.Add(
+                        issue
+                            FsckSeverity.Error
+                            FsckIssueKind.Object
+                            (Some hash)
+                            None
+                            $"expected {expected}, found {objectType}")
+                | _ -> ()
+
+            while pending.Count > 0 do
+                let hash, expectedType, validate = pending.Pop()
+                match objectTypes.TryGetValue hash with
+                | true, objectType ->
+                    checkExpectedType hash expectedType objectType
+                | false, _ when validate ->
+                    checkedObjects.Add hash |> ignore
+                    match ReadObjects.readRawObject repo hash with
+                    | Error error ->
+                        issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
+                    | Ok (objectType, content) ->
+                        objectTypes.[hash] <- objectType
+                        checkExpectedType hash expectedType objectType
+                        match validateObjectId hash objectType content with
+                        | Error error ->
+                            issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
+                        | Ok () -> ()
+                        match parseRaw objectType content with
+                        | Error error ->
+                            issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
+                        | Ok objectValue ->
+                            for childHash, childType in objectChildren objectValue do
+                                pending.Push(childHash, childType, introduced.Contains childHash)
+                | false, _ ->
+                    if checkedObjects.Add hash && not (ReadObjects.objectExists repo hash) then
+                        issues.Add(
+                            issue
+                                FsckSeverity.Error
+                                FsckIssueKind.Object
+                                (Some hash)
+                                None
+                                $"Object not found: {hash}")
+
+            Ok {
+                RefsChecked = tips.Length
+                ObjectsChecked = checkedObjects.Count
+                PacksChecked = 0
+                Issues = List.ofSeq issues
+            }
+        with ex -> Error $"Introduced-object fsck failed: {ex.Message}"
+
     let private validateLooseObject (path: string) (expectedHash: GitHash) =
         try
             let raw = File.ReadAllBytes path |> Compression.decompress

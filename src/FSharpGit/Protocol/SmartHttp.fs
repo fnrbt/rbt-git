@@ -302,6 +302,7 @@ module SmartHttp =
         lock (lockFor repo) (fun () ->
             let mutable unpackStatus = "ok"
             let needsPack = commands |> Seq.exists (fun (_, newSha, _) -> newSha <> zeroId)
+            let mutable introducedObjects: GitHash[] = [||]
             let quarantinePath = repo.GitDir + ".quarantine-" + Guid.NewGuid().ToString("N")
             try
                 if needsPack then
@@ -313,7 +314,7 @@ module SmartHttp =
                         | Error error -> unpackStatus <- error
                         | Ok written ->
                             match PackWriter.promoteLooseObjects quarantine repo written with
-                            | Ok () -> ()
+                            | Ok () -> introducedObjects <- written
                             | Error error -> unpackStatus <- error
 
                 let isProtected refName = List.contains refName options.ProtectedRefs
@@ -342,32 +343,25 @@ module SmartHttp =
                             results.Add(refName, "ok")
 
                 if results |> Seq.exists (fun (_, status) -> status = "ok") then
-                    match References.snapshot repo RefPolicy.Replication with
+                    let updatedTips =
+                        seq {
+                            for index in 0 .. commands.Count - 1 do
+                                let _, newSha, _ = commands.[index]
+                                let _, status = results.[index]
+                                if status = "ok" && newSha <> zeroId then yield newSha
+                        }
+                    match Fsck.verifyIntroduced repo updatedTips introducedObjects with
                     | Error error ->
                         unpackStatus <- error
                         for index in 0 .. results.Count - 1 do
                             let refName, status = results.[index]
                             if status = "ok" then results.[index] <- refName, "ng repository integrity error"
-                    | Ok current ->
-                        let mutable refs = current.Refs
-                        for index in 0 .. commands.Count - 1 do
-                            let _, newSha, refName = commands.[index]
-                            let _, status = results.[index]
-                            if status = "ok" then
-                                refs <- if newSha = zeroId then Map.remove refName refs else Map.add refName newSha refs
-                        let proposed = { current with Refs = refs; Digest = "" }
-                        match Fsck.verifyReachable repo proposed with
-                        | Error error ->
-                            unpackStatus <- error
-                            for index in 0 .. results.Count - 1 do
-                                let refName, status = results.[index]
-                                if status = "ok" then results.[index] <- refName, "ng repository integrity error"
-                        | Ok report when not report.IsValid ->
-                            unpackStatus <- "reachable object validation failed"
-                            for index in 0 .. results.Count - 1 do
-                                let refName, status = results.[index]
-                                if status = "ok" then results.[index] <- refName, "ng repository integrity error"
-                        | Ok _ -> ()
+                    | Ok report when not report.IsValid ->
+                        unpackStatus <- "introduced object validation failed"
+                        for index in 0 .. results.Count - 1 do
+                            let refName, status = results.[index]
+                            if status = "ok" then results.[index] <- refName, "ng repository integrity error"
+                    | Ok _ -> ()
 
                 for index in 0 .. commands.Count - 1 do
                     let _, newSha, refName = commands.[index]
