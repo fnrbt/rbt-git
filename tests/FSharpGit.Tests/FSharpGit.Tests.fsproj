@@ -9,4 +9,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/FSharpGit/FSharpGit.fsproj" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Update="FSharp.Core" Version="10.1.302" />
+  </ItemGroup>
 </Project>

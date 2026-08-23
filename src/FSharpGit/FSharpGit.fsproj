@@ -34,4 +34,7 @@
     <Compile Include="Protocol\SmartHttp.fs" />
     <Compile Include="Operations\Remote.fs" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Update="FSharp.Core" Version="10.1.302" />
+  </ItemGroup>
 </Project>
