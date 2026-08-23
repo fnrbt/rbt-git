@@ -51,6 +51,14 @@ module PackWriter =
     /// reachable from `haves`.
     let objectClosure (repo: Repo) (wants: GitHash[]) (haves: GitHash[]) : GitHash[] =
         let havesSet = HashSet<GitHash>(haves)
+        // A common commit means the client also has every tree and blob in
+        // that commit's snapshot. Excluding only the commit IDs still resends
+        // the entire unchanged working tree on every incremental fetch.
+        let haveObjects = HashSet<GitHash>()
+        for have in haves do
+            match ReadObjects.readCommit repo have with
+            | Ok commit -> collectTree repo commit.Tree haveObjects
+            | Error _ -> ()
         let commitsSeen = HashSet<GitHash>()
         let commits = ResizeArray<GitHash>()
         let queue = Queue<GitHash>(wants)
@@ -79,6 +87,7 @@ module PackWriter =
                     | Ok (Commit tc) -> collectTree repo tc.Tree objs
                     | _ -> ()
                 | Error _ -> ()
+        objs.ExceptWith haveObjects
         objs |> Seq.toArray
 
     /// Depth-limited closure for shallow clone. Returns (objectIds, shallowBoundary):
