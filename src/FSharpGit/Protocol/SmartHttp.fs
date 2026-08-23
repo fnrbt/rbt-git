@@ -159,7 +159,22 @@ module SmartHttp =
                     PktLine.writeStr output "NAK\n"
                     PackStream.writeTo repo objs useDelta useSideband output
                 Ok()
+            elif not doneSeen then
+                // Stateless-HTTP compute round: reply "NAK" and end the response.
+                // We advertise no multi_ack, so we never acknowledge a common --
+                // git keeps offering haves and, receiving only NAK, sends "done"
+                // and reads the final NAK + pack via get_pack(). Critically, emit
+                // NO trailing flush: git's get_ack() reads exactly one ACK/NAK and
+                // a following flush aborts the fetch with
+                // "expected ACK/NAK, got a flush packet". (Sending "ACK <sha>"
+                // instead would put git in its "ready" state, after which it
+                // expects the done round to be the packfile alone.)
+                PktLine.writeStr output "NAK\n"
+                Ok()
             else
+                // Done round: final NAK then the packfile. objectClosure excludes
+                // history reachable from the haves, so the pack stays incremental
+                // even though we never ACKed a specific common.
                 let objs = PackWriter.objectClosure repo (wants.ToArray()) (haves.ToArray())
                 PktLine.writeStr output "NAK\n"
                 PackStream.writeTo repo objs useDelta useSideband output
