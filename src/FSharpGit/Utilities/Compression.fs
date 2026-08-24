@@ -43,5 +43,5 @@ module Compression =
         if data.Length = 0 then
             stream.Write(emptyZlibMember)
         else
-            use zlib = new ZLibStream(stream, CompressionLevel.Optimal, leaveOpen = true)
+            use zlib = new ZLibStream(stream, CompressionLevel.Fastest, leaveOpen = true)
             zlib.Write(data, 0, data.Length)
