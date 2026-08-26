@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build and publish the FSharpGit NuGet package to the Forge registry.
+"""Build and publish the Rbt.Git NuGet package to the Forge registry.
 
 Runs inside the Forge publish-action shell. The coordinator's executor mints a
 scoped `fpk_` publisher from the action's `packages.publish` declaration and
 injects `FORGE_PACKAGE_SOURCE` (the registry v3 index URL) and
-`FORGE_PACKAGE_API_KEYS` (a JSON prefix->token map). FSharpGit is a leaf package
+`FORGE_PACKAGE_API_KEYS` (a JSON prefix->token map). Rbt.Git is a leaf package
 (only implicit FSharp.Core from nuget.org), so a plain `dotnet pack` is enough;
 no dependency-graph rewrite is required.
 
@@ -45,16 +45,16 @@ def main() -> int:
         api_keys = json.loads(os.environ.get("FORGE_PACKAGE_API_KEYS") or "{}")
     except json.JSONDecodeError as error:
         fail(f"FORGE_PACKAGE_API_KEYS is not valid JSON: {error}")
-    api_key = api_keys.get("FSharpGit")
+    api_key = api_keys.get("Rbt.Git")
     if not api_key:
-        fail("FORGE_PACKAGE_API_KEYS has no FSharpGit publisher token")
+        fail("FORGE_PACKAGE_API_KEYS has no Rbt.Git publisher token")
 
     source_sha = os.environ.get("FORGE_SOURCE_SHA", "")
 
     # Build in an out-of-tree work directory so the checkout stays clean.
     workdir = Path(tempfile.mkdtemp(prefix="fsharpgit-publish-"))
 
-    # FSharpGit's only dependency is FSharp.Core from nuget.org. Pin the source
+    # Rbt.Git's only dependency is FSharp.Core from nuget.org. Pin the source
     # explicitly so packing does not depend on the sandbox's default config.
     nuget_config = workdir / "NuGet.Config"
     nuget_config.write_text(
@@ -69,7 +69,7 @@ def main() -> int:
     )
 
     output = workdir / "nupkg"
-    project = "src/FSharpGit/FSharpGit.fsproj"
+    project = "src/Rbt.Git/Rbt.Git.fsproj"
     command = [
         "dotnet",
         "pack",
@@ -113,20 +113,20 @@ def main() -> int:
             "X-Forge-Version-Mode": "explicit",
         },
     )
-    print(f"+ publish FSharpGit {version} to {endpoint}", flush=True)
+    print(f"+ publish Rbt.Git {version} to {endpoint}", flush=True)
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
             if response.status < 200 or response.status >= 300:
                 fail(f"publish returned HTTP {response.status}")
     except urllib.error.HTTPError as error:
         if error.code == 409:
-            print(f"FSharpGit {version} is already published (409); no-op", flush=True)
+            print(f"Rbt.Git {version} is already published (409); no-op", flush=True)
             return 0
         detail = error.read(4096).decode("utf-8", errors="replace")
         fail(f"publish failed with HTTP {error.code}: {detail}")
     except (OSError, urllib.error.URLError) as error:
         fail(f"publish failed: {error}")
-    print(f"published FSharpGit {version}", flush=True)
+    print(f"published Rbt.Git {version}", flush=True)
     return 0
 
 

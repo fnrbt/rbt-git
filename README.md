@@ -1,4 +1,4 @@
-# FSharpGit
+# Rbt.Git
 
 A pure F# library for reading Git repositories, implemented with zero external dependencies.
 
@@ -174,7 +174,7 @@ match GitConfig.readConfig repo with
 ## Project Structure
 
 ```
-src/FSharpGit/
+src/Rbt.Git/
 ├── Core/
 │   ├── Types.fs          - Core discriminated unions and types
 │   ├── Repository.fs     - Repository structure and path management
@@ -222,7 +222,7 @@ dotnet fsi examples/SampleUsage.fsx
 
 ### Core Modules
 
-#### FSharpGit.Types
+#### Rbt.Git.Types
 Core types for Git objects, commits, trees, etc.
 
 - `GitHash` - 40-character hex string for object hashes
@@ -231,14 +231,14 @@ Core types for Git objects, commits, trees, etc.
 - `Signature` - Author/committer information
 - `Repo`, `PackIndex`, `GitIndex` - Repository structures
 
-#### FSharpGit.Repository
+#### Rbt.Git.Repository
 Repository initialization and path management.
 
 - `locateRepo` - Find repository at or above given path
 - `openRepo` - Open repository with Result error handling
 - `getHeadFile`, `getConfigFile`, `getIndexPath` - Path utilities
 
-#### FSharpGit.GitConfig
+#### Rbt.Git.GitConfig
 Git config file parsing and manipulation.
 
 - `readConfig` - Parse .git/config file
@@ -248,7 +248,7 @@ Git config file parsing and manipulation.
 - `removeValue` - Remove config value
 - `removeSection` - Remove entire config section
 
-#### FSharpGit.References
+#### Rbt.Git.References
 Branch, tag, and reference operations.
 
 - `readHead` - Read HEAD reference
@@ -258,34 +258,34 @@ Branch, tag, and reference operations.
 
 ### Parsing Modules
 
-#### FSharpGit.ObjectParser
+#### Rbt.Git.ObjectParser
 Parse blob, tree, commit, and tag objects.
 
 - `parseObject` - Parse any git object
 - `parseBlob`, `parseTree`, `parseCommit`, `parseTag` - Parse specific types
 
-#### FSharpGit.PackParser
+#### Rbt.Git.PackParser
 Parse pack index and pack files.
 
 - `readPackIndex` - Parse .idx file
 - `readPackFile` - Read object from .pack file
 - `findPackObject` - Find object in any pack file
 
-#### FSharpGit.IndexParser
+#### Rbt.Git.IndexParser
 Parse the .git/index file.
 
 - `readIndex` - Parse index to GitIndex structure
 
 ### Operations Modules
 
-#### FSharpGit.ReadObjects
+#### Rbt.Git.ReadObjects
 Read git objects from repository.
 
 - `readObject`, `readBlob`, `readTree`, `readCommit`, `readTag` - Read specific objects
 - `objectExists` - Check if object exists
 - `readObjectCached` - Read with caching
 
-#### FSharpGit.CommitHistory
+#### Rbt.Git.CommitHistory
 Commit walking and ancestry.
 
 - `getParents` - Get commit parents
@@ -294,7 +294,7 @@ Commit walking and ancestry.
 - `mergeBase` - Find common ancestor
 - `getRevList` - Get commit hash list
 
-#### FSharpGit.TreeOperations
+#### Rbt.Git.TreeOperations
 Tree traversal and path resolution.
 
 - `resolvePath` - Resolve path in tree
@@ -303,14 +303,14 @@ Tree traversal and path resolution.
 - `getFileAtCommit` - Get file content from commit
 - `treeToMap` - Convert tree to path->hash map
 
-#### FSharpGit.Diff
+#### Rbt.Git.Diff
 Compare commits and trees.
 
 - `diffTrees`, `diffCommits` - Compare and return changes
 - `getChangedFiles` - Get files changed by commit
 - `diffWorkingTree` - Diff working tree vs index
 
-#### FSharpGit.Merge
+#### Rbt.Git.Merge
 Perform 3-way merges and fast-forward.
 
 - `mergeCommits` - Merge commits with base
@@ -318,7 +318,7 @@ Perform 3-way merges and fast-forward.
 - `threeWayMerge` - Merge two commits
 - `checkConflicts` - Check for conflicts
 
-#### FSharpGit.Remote
+#### Rbt.Git.Remote
 Remote configuration and operations.
 
 - `listRemotes`, `getRemote` - Query remotes
@@ -327,7 +327,7 @@ Remote configuration and operations.
 - `fetch` - Fetch HTTP(S) remotes into `refs/remotes/<name>/*`
 - `fetchMirror`, `fetchMirrorWithAuth` - Mirror HTTP(S) remotes with optional pruning
 
-#### FSharpGit.RepositoryOperations
+#### Rbt.Git.RepositoryOperations
 High-level repository operations.
 
 - `getStatus` - Get working tree status
@@ -339,20 +339,20 @@ High-level repository operations.
 
 ### Utilities Modules
 
-#### FSharpGit.Hashing
+#### Rbt.Git.Hashing
 SHA-1 hashing functions.
 
 - `sha1`, `sha1String` - Compute SHA-1 hash
 - `hashBlob`, `hashTree`, `hashCommit` - Hash git objects
 - `parseHash`, `isValidHash` - Hash utilities
 
-#### FSharpGit.Compression
+#### Rbt.Git.Compression
 Zlib compression/decompression.
 
 - `compress`, `decompress` - Compress/decompress byte arrays
 - `compressToStream`, `decompressStream` - Stream operations
 
-#### FSharpGit.PathUtils
+#### Rbt.Git.PathUtils
 Path normalization utilities.
 
 - `normalizeGitPath`, `toGitPath` - Convert to git paths

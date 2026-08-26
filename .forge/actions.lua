@@ -13,7 +13,7 @@ return {
             base = publish,
             packages = {
                 publish = {
-                    { registry = "41021897", ecosystem = "nuget", mode = "explicit", prefix = "FSharpGit" },
+                    { registry = "41021897", ecosystem = "nuget", mode = "explicit", prefix = "Rbt.Git" },
                 },
             },
         }
