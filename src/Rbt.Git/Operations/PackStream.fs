@@ -83,7 +83,7 @@ module PackStream =
         let emit (data: byte[]) = emitSlice data 0 data.Length
 
         if useSideband then
-            let payload = Array.append [| 2uy |] (Encoding.UTF8.GetBytes(sprintf "fsgit: packing %d objects\n" objectIds.Length))
+            let payload = Array.append [| 2uy |] (Encoding.UTF8.GetBytes(sprintf "rbt-git: packing %d objects\n" objectIds.Length))
             let framed = PktLine.encode payload
             output.Write(framed, 0, framed.Length)
 
@@ -100,6 +100,8 @@ module PackStream =
                 emitSlice data offset count
                 packOffset <- packOffset + int64 count)
 
+        use reader = new PackStore.ReadSession(repo)
+
         let writeWholeObject (typeNumber: int) (content: byte[]) =
             use header = new MemoryStream()
             writeObjHeaderTo header typeNumber content.Length
@@ -108,59 +110,66 @@ module PackStream =
             packOffset <- packOffset + int64 headerBytes.Length
             Compression.compressToStream(content, entryOutput)
 
-        for id in objectIds do
-            match ReadObjects.readRawObject repo id with
-            | Ok (t, content) ->
-                let tn = PackData.typeNum t
-                let entryStart = packOffset
-                let baseOpt =
-                    if useDelta && content.Length <= maxWindowBytesPerType then
-                        match windows.TryGetValue tn with
-                        | true, win when win.Count > 0 -> Some win.[win.Count - 1]
-                        | _ -> None
-                    else None
-                let mutable entryDepth = 0
-                match baseOpt with
-                | Some (baseOff, baseContent, baseDepth) when baseDepth < 50 ->
-                    let delta = Gc.encodeDelta baseContent content
-                    let zd = Compression.compress delta
-                    let zc = Compression.compress content
-                    use entry = new MemoryStream()
-                    if zd.Length < zc.Length then
-                        writeObjHeaderTo entry 6 delta.Length
-                        writeOfsDistance entry (entryStart - baseOff)
-                        entry.Write(zd, 0, zd.Length)
-                        entryDepth <- baseDepth + 1
-                    else
-                        writeObjHeaderTo entry tn content.Length
-                        entry.Write(zc, 0, zc.Length)
-                    let entryBytes = entry.ToArray()
-                    emit entryBytes
-                    packOffset <- packOffset + int64 entryBytes.Length
-                | _ ->
-                    writeWholeObject tn content
+        let orderedIds = reader.OrderForStreaming objectIds
+        let included = HashSet<GitHash>(objectIds)
+        let copyEntry data offset count =
+            emitSlice data offset count
+            packOffset <- packOffset + int64 count
 
-                if content.Length <= maxWindowBytesPerType then
-                    let win =
-                        match windows.TryGetValue tn with
-                        | true, existing -> existing
-                        | _ ->
-                            let created = ResizeArray()
-                            windows.[tn] <- created
-                            created
-                    let mutable retainedBytes =
-                        match windowBytes.TryGetValue tn with
-                        | true, value -> value
-                        | _ -> 0
-                    while win.Count > 0
-                          && (win.Count >= window
-                              || retainedBytes + content.Length > maxWindowBytesPerType) do
-                        let _, evicted, _ = win.[0]
-                        win.RemoveAt 0
-                        retainedBytes <- retainedBytes - evicted.Length
-                    win.Add(entryStart, content, entryDepth)
-                    windowBytes.[tn] <- retainedBytes + content.Length
-            | Error _ -> ()
+        for id in orderedIds do
+            if not (reader.TryCopyPackedEntry id included copyEntry) then
+                match reader.TryRead id with
+                | Some (t, content) ->
+                    let tn = PackData.typeNum t
+                    let entryStart = packOffset
+                    let baseOpt =
+                        if useDelta && content.Length <= maxWindowBytesPerType then
+                            match windows.TryGetValue tn with
+                            | true, win when win.Count > 0 -> Some win.[win.Count - 1]
+                            | _ -> None
+                        else None
+                    let mutable entryDepth = 0
+                    match baseOpt with
+                    | Some (baseOff, baseContent, baseDepth) when baseDepth < 50 ->
+                        let delta = Gc.encodeDelta baseContent content
+                        let zd = Compression.compress delta
+                        let zc = Compression.compress content
+                        use entry = new MemoryStream()
+                        if zd.Length < zc.Length then
+                            writeObjHeaderTo entry 6 delta.Length
+                            writeOfsDistance entry (entryStart - baseOff)
+                            entry.Write(zd, 0, zd.Length)
+                            entryDepth <- baseDepth + 1
+                        else
+                            writeObjHeaderTo entry tn content.Length
+                            entry.Write(zc, 0, zc.Length)
+                        let entryBytes = entry.ToArray()
+                        emit entryBytes
+                        packOffset <- packOffset + int64 entryBytes.Length
+                    | _ ->
+                        writeWholeObject tn content
+
+                    if content.Length <= maxWindowBytesPerType then
+                        let win =
+                            match windows.TryGetValue tn with
+                            | true, existing -> existing
+                            | _ ->
+                                let created = ResizeArray()
+                                windows.[tn] <- created
+                                created
+                        let mutable retainedBytes =
+                            match windowBytes.TryGetValue tn with
+                            | true, value -> value
+                            | _ -> 0
+                        while win.Count > 0
+                              && (win.Count >= window
+                                  || retainedBytes + content.Length > maxWindowBytesPerType) do
+                            let _, evicted, _ = win.[0]
+                            win.RemoveAt 0
+                            retainedBytes <- retainedBytes - evicted.Length
+                        win.Add(entryStart, content, entryDepth)
+                        windowBytes.[tn] <- retainedBytes + content.Length
+                | None -> ()
 
         let trailer = hash.GetHashAndReset()
         if useSideband then

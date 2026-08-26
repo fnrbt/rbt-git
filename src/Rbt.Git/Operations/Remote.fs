@@ -230,7 +230,7 @@ module Remote =
 
     let private buildUploadPackRequest (wants: GitHash list) (haves: GitHash list) =
         use ms = new MemoryStream()
-        let caps = "multi_ack_detailed side-band-64k ofs-delta agent=fsgit-client/0.1"
+        let caps = "multi_ack_detailed side-band-64k ofs-delta agent=rbt-git-client/0.1"
         match wants with
         | [] -> ()
         | first :: rest ->

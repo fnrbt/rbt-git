@@ -52,7 +52,7 @@ def main() -> int:
     source_sha = os.environ.get("FORGE_SOURCE_SHA", "")
 
     # Build in an out-of-tree work directory so the checkout stays clean.
-    workdir = Path(tempfile.mkdtemp(prefix="fsharpgit-publish-"))
+    workdir = Path(tempfile.mkdtemp(prefix="rbt-git-publish-"))
 
     # Rbt.Git's only dependency is FSharp.Core from nuget.org. Pin the source
     # explicitly so packing does not depend on the sandbox's default config.

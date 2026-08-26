@@ -19,7 +19,7 @@ module SmartHttp =
         ms.Write(b, 0, b.Length)
 
     /// Resolve a FULL ref name (e.g. "refs/heads/main" or "HEAD") to a sha,
-    /// following symref chains and consulting packed-refs. (fsgit's
+    /// following symref chains and consulting packed-refs. (Rbt.Git's
     /// References.resolveReference expects a refs-relative path and double-counts
     /// the "refs/" prefix, so we resolve against GitDir directly here.)
     let rec resolveFull (repo: Repo) (name: string) (depth: int) : GitHash option =
@@ -74,8 +74,8 @@ module SmartHttp =
             | _ -> None
         let baseCaps =
             match service with
-            | "git-upload-pack" -> "shallow ofs-delta side-band-64k agent=fsgit/0.1"
-            | _ -> "report-status delete-refs ofs-delta agent=fsgit/0.1"
+            | "git-upload-pack" -> "shallow ofs-delta side-band-64k agent=rbt-git/0.1"
+            | _ -> "report-status delete-refs ofs-delta agent=rbt-git/0.1"
         let caps =
             match service, headTarget with
             | "git-upload-pack", Some t -> sprintf "%s symref=HEAD:%s" baseCaps t
@@ -432,7 +432,7 @@ module SmartHttp =
         w ms "# service=git-upload-pack\n"
         PktLine.writeFlush ms
         w ms "version 2\n"
-        w ms "agent=fsgit/0.1\n"
+        w ms "agent=rbt-git/0.1\n"
         w ms "ls-refs=unborn\n"
         w ms "fetch=shallow\n"
         w ms "object-format=sha1\n"

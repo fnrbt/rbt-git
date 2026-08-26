@@ -278,3 +278,24 @@ module PackData =
             | Some (bt, bc) -> bt, applyDelta bc delta
             | None -> failwithf "ref-delta base not found: %s" baseHash
         | other -> failwithf "unsupported pack object type %d" other
+
+    /// Read only a packed entry's header and delta-base metadata. The returned
+    /// data offset points at the existing zlib payload, which callers can copy
+    /// without inflating and recompressing it.
+    let internal readEntryMetadataFromStream
+        (pack: Stream)
+        (start: int64)
+        : struct (int * int * int64 * int64 option * GitHash option) =
+        pack.Position <- start
+        let typeId, size = readObjHeaderFromStream pack
+        match typeId with
+        | 1 | 2 | 3 | 4 ->
+            struct (typeId, size, pack.Position, None, None)
+        | 6 ->
+            let relativeOffset = readOfsBaseFromStream pack
+            struct (typeId, size, pack.Position, Some(start - int64 relativeOffset), None)
+        | 7 ->
+            let baseHash = hashOf (readExact pack 20) 0
+            struct (typeId, size, pack.Position, None, Some baseHash)
+        | other ->
+            failwithf "unsupported pack object type %d" other

@@ -39,7 +39,7 @@ let sendPack destination oldTip newTip refName source packedObjects =
     SmartHttp.receivePack destination (request.ToArray())
 
 let withRepositories test =
-    let root = Path.Combine(Path.GetTempPath(), "fsgit-receive-tests-" + Guid.NewGuid().ToString("N"))
+    let root = Path.Combine(Path.GetTempPath(), "rbt-git-receive-tests-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory root |> ignore
     try
         let destination = Repository.initBare (Path.Combine(root, "destination.git")) |> value
@@ -200,6 +200,7 @@ let realGitIncrementalFetchStaysIncremental () =
             |> value
         let initialCommit = writeCommit source initialTree [||] "initial"
         References.writeDirectAtomic source "refs/heads/master" initialCommit |> value
+        Gc.repack source |> value |> ignore
 
         use reservation = new TcpListener(IPAddress.Loopback, 0)
         reservation.Start()
