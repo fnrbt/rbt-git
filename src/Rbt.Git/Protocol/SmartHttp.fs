@@ -281,13 +281,18 @@ module SmartHttp =
             Ok()
 
     /// Push policy. ProtectedRefs may not be force-updated or deleted (typically
-    /// the default branch). AllowNonFastForward governs force-push on other refs.
+    /// the default branch). AllowNonFastForward governs force-push on other refs;
+    /// AllowProtectedRefRewrite is an explicit caller-authorized maintenance path.
     type ReceiveOptions = {
         ProtectedRefs: string list
         AllowNonFastForward: bool
+        AllowProtectedRefRewrite: bool
     }
 
-    let defaultReceiveOptions = { ProtectedRefs = []; AllowNonFastForward = true }
+    let defaultReceiveOptions =
+        { ProtectedRefs = []
+          AllowNonFastForward = true
+          AllowProtectedRefRewrite = false }
 
     // One lock per repo (keyed by git dir) serializes pushes to a repo so
     // concurrent agents can't interleave unpack + ref updates.
@@ -352,7 +357,9 @@ module SmartHttp =
                         let isFastForward =
                             oldSha = zeroId
                             || (match CommitHistory.isAncestor repo oldSha newSha with Ok true -> true | _ -> false)
-                        if not isFastForward && (isProtected refName || not options.AllowNonFastForward) then
+                        if not isFastForward
+                           && (not options.AllowNonFastForward
+                               || (isProtected refName && not options.AllowProtectedRefRewrite)) then
                             results.Add(refName, "ng non-fast-forward")
                         else
                             results.Add(refName, "ok")

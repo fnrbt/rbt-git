@@ -30,13 +30,16 @@ let writeCommit repo tree parents message =
     }
     |> value
 
-let sendPack destination oldTip newTip refName source packedObjects =
+let sendPackWithOptions destination oldTip newTip refName source packedObjects options =
     let pack = PackWriter.writePackFor source packedObjects |> value
     use request = new MemoryStream()
     PktLine.writeStr request $"{oldTip} {newTip} {refName}\000report-status\n"
     PktLine.writeFlush request
     request.Write(pack, 0, pack.Length)
-    SmartHttp.receivePack destination (request.ToArray())
+    SmartHttp.receivePackWith destination options (request.ToArray())
+
+let sendPack destination oldTip newTip refName source packedObjects =
+    sendPackWithOptions destination oldTip newTip refName source packedObjects SmartHttp.defaultReceiveOptions
 
 let withRepositories test =
     let root = Path.Combine(Path.GetTempPath(), "rbt-git-receive-tests-" + Guid.NewGuid().ToString("N"))
@@ -124,6 +127,46 @@ let rejectsMissingIntroducedGraphObject () =
         check
             (SmartHttp.resolveFull destination "refs/heads/master" 0 = None)
             "receive-pack updated a ref to an incomplete object graph")
+
+let protectedRefRewriteRequiresExplicitAuthorization () =
+    withRepositories (fun destination source ->
+        let oldBlob = ObjectWriter.writeBlob destination (Encoding.UTF8.GetBytes "old") |> value
+        let oldTree =
+            ObjectWriter.writeTree destination
+                [| { Mode = 0o100644; Path = "value.txt"; Hash = oldBlob } |]
+            |> value
+        let oldCommit = writeCommit destination oldTree [||] "old"
+        References.writeDirectAtomic destination "refs/heads/master" oldCommit |> value
+
+        let newBlob = ObjectWriter.writeBlob source (Encoding.UTF8.GetBytes "new") |> value
+        let newTree =
+            ObjectWriter.writeTree source
+                [| { Mode = 0o100644; Path = "value.txt"; Hash = newBlob } |]
+            |> value
+        let newCommit = writeCommit source newTree [||] "new root"
+        let objects = [| newBlob; newTree; newCommit |]
+        let deny =
+            { SmartHttp.defaultReceiveOptions with
+                ProtectedRefs = [ "refs/heads/master" ]
+                AllowProtectedRefRewrite = false }
+        let denied =
+            sendPackWithOptions destination oldCommit newCommit "refs/heads/master" source objects deny
+            |> Encoding.UTF8.GetString
+        check
+            (denied.Contains("ng refs/heads/master non-fast-forward"))
+            $"protected ref rewrite was not rejected: {denied}"
+        check
+            (SmartHttp.resolveFull destination "refs/heads/master" 0 = Some oldCommit)
+            "rejected protected ref rewrite changed the branch"
+
+        let allow = { deny with AllowProtectedRefRewrite = true }
+        let accepted =
+            sendPackWithOptions destination oldCommit newCommit "refs/heads/master" source objects allow
+            |> Encoding.UTF8.GetString
+        check (accepted.Contains("ok refs/heads/master")) "authorized protected ref rewrite was rejected"
+        check
+            (SmartHttp.resolveFull destination "refs/heads/master" 0 = Some newCommit)
+            "authorized protected ref rewrite did not update the branch")
 
 let streamsPackOnlyAfterClientSendsDone () =
     withRepositories (fun _ source ->
@@ -298,6 +341,7 @@ let realGitIncrementalFetchStaysIncremental () =
 let main _ =
     acceptsPushWithoutWalkingHistoricalGraph ()
     rejectsMissingIntroducedGraphObject ()
+    protectedRefRewriteRequiresExplicitAuthorization ()
     streamsPackOnlyAfterClientSendsDone ()
     realGitIncrementalFetchStaysIncremental ()
     printfn "upload-pack/receive-pack protocol contract passed"
