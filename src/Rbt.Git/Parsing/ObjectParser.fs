@@ -6,33 +6,31 @@ open System.Text
 open System.Text.RegularExpressions
 
 module ObjectParser =
+    let private utf8 = UTF8Encoding(false, true)
     
     let private parseHeader (data: byte[]) : string * byte[] =
         let nullIndex = Array.IndexOf(data, 0uy)
-        if nullIndex < 0 then
-            failwith "Invalid object format: no null byte found"
-        
-        let header = Encoding.UTF8.GetString(data.[0..nullIndex])
-        let content = data.[nullIndex + 1..]
-        header, content
-    
+        if nullIndex < 0 then failwith "Invalid object format: missing header delimiter"
+        let header = Encoding.ASCII.GetString(data, 0, nullIndex)
+        let space = header.IndexOf ' '
+        if space < 1 then failwith "Invalid object header"
+        let mutable length = 0L
+        if not (Int64.TryParse(header.Substring(space + 1), &length))
+           || length <> int64 (data.Length - nullIndex - 1) then
+            failwith "Object content length mismatch"
+        header, data.[nullIndex + 1..]
+
     let private parseSignature (str: string) : Signature =
-        let regex = Regex(@"^(.+) <(.+)> (\d+) ([+-]\d{4})$")
-        let m = regex.Match str
-        if not m.Success then
-            failwith $"Invalid signature format: {str}"
-        
-        let name = m.Groups.[1].Value
-        let email = m.Groups.[2].Value
-        let time = int64 m.Groups.[3].Value
-        let offset = int m.Groups.[4].Value
-        let hours = offset / 100
-        let minutes = abs (offset % 100)
-        let timeZoneOffset = TimeSpan(hours, minutes, 0)
-        let dateTime = DateTimeOffset.FromUnixTimeSeconds time
-        let dateTime = dateTime.ToOffset timeZoneOffset
-        
-        { Name = name; Email = email; Time = dateTime }
+        let matched = Regex.Match(str, @"^(.*) <([^<>]*)> (-?\d+) ([+-])(\d{2})(\d{2})$")
+        if not matched.Success then failwith $"Invalid signature format: {str}"
+        let hours = int matched.Groups.[5].Value
+        let minutes = int matched.Groups.[6].Value
+        if hours > 14 || minutes >= 60 || (hours = 14 && minutes <> 0) then
+            failwith "Invalid signature timezone"
+        let offset = TimeSpan(hours, minutes, 0)
+        let offset = if matched.Groups.[4].Value = "-" then -offset else offset
+        let dateTime = DateTimeOffset.FromUnixTimeSeconds(Int64.Parse matched.Groups.[3].Value).ToOffset offset
+        { Name = matched.Groups.[1].Value; Email = matched.Groups.[2].Value; Time = dateTime }
     
     let parseBlob (data: byte[]) : byte[] =
         let header, content = parseHeader data
@@ -45,90 +43,65 @@ module ObjectParser =
         if not (header.StartsWith "tree ") then
             failwith $"Not a tree object: {header}"
         
-        let rec parseEntries (offset: int) (acc: TreeEntry list) : TreeEntry list =
-            if offset >= content.Length then
-                List.rev acc
-            else
-                let spaceIndex = Array.IndexOf(content, 32uy, offset)
-                let nullIndex = Array.IndexOf(content, 0uy, spaceIndex)
-                
-                let modeStr = Encoding.UTF8.GetString(content.[offset..spaceIndex - 1])
-                let mode = Convert.ToInt32(modeStr, 8)
-                let path = Encoding.UTF8.GetString(content.[spaceIndex + 1..nullIndex - 1])
-                let hash = BitConverter.ToString(content.[nullIndex + 1..nullIndex + 20]).Replace("-", "").ToLowerInvariant()
-                
-                parseEntries (nullIndex + 21) ({ Mode = mode; Path = path; Hash = hash } :: acc)
-        
-        parseEntries 0 [] |> List.toArray
+        let entries = ResizeArray<TreeEntry>()
+        let mutable offset = 0
+        while offset < content.Length do
+            let spaceIndex = Array.IndexOf(content, 32uy, offset)
+            if spaceIndex < offset || spaceIndex = offset then failwith "Invalid tree mode"
+            let nullIndex = Array.IndexOf(content, 0uy, spaceIndex + 1)
+            if nullIndex < 0 || nullIndex + 21 > content.Length then failwith "Truncated tree entry"
+            let mode = Convert.ToInt32(Encoding.ASCII.GetString(content, offset, spaceIndex - offset), 8)
+            let path = utf8.GetString(content, spaceIndex + 1, nullIndex - spaceIndex - 1)
+            let hash = Convert.ToHexString(content, nullIndex + 1, 20).ToLowerInvariant()
+            entries.Add { Mode = mode; Path = path; Hash = hash }
+            offset <- nullIndex + 21
+        entries.ToArray()
     
+    let private parseMessageObject (content: byte[]) =
+        let text = utf8.GetString content
+        let separator = text.IndexOf("\n\n", StringComparison.Ordinal)
+        if separator < 0 then failwith "Missing object message delimiter"
+        text.Substring(0, separator).Split('\n'), text.Substring(separator + 2)
+
     let parseCommit (data: byte[]) : CommitData =
         let header, content = parseHeader data
-        if not (header.StartsWith "commit ") then
-            failwith $"Not a commit object: {header}"
-        
-        let lines = Encoding.UTF8.GetString(content).Split('\n')
-        let rec parseCommitLines index (tree: string option) (parents: string list) (author: Signature option) (committer: Signature option) (message: StringBuilder) =
-            if index >= lines.Length then
-                let messageStr = message.ToString().TrimStart()
-                { Tree = tree.Value
-                  Parents = List.toArray parents
-                  Author = author.Value
-                  Committer = committer.Value
-                  Message = messageStr }
-            else
-                let line = lines.[index]
-                if line.StartsWith "tree " then
-                    parseCommitLines (index + 1) (Some line.[5..]) parents author committer message
-                elif line.StartsWith "parent " then
-                    parseCommitLines (index + 1) tree (line.[7..] :: parents) author committer message
-                elif line.StartsWith "author " then
-                    let signature = parseSignature line.[7..]
-                    parseCommitLines (index + 1) tree parents (Some signature) committer message
-                elif line.StartsWith "committer " then
-                    let signature = parseSignature line.[10..]
-                    parseCommitLines (index + 1) tree parents author (Some signature) message
-                elif String.IsNullOrWhiteSpace line then
-                    if index + 1 < lines.Length then
-                        message.AppendLine(String.Join("\n", lines.[index + 1..])) |> ignore
-                    parseCommitLines lines.Length tree parents author committer message
-                else
-                    parseCommitLines (index + 1) tree parents author committer message
-        
-        parseCommitLines 0 None [] None None (StringBuilder())
+        if not (header.StartsWith "commit ") then failwith $"Not a commit object: {header}"
+        let lines, message = parseMessageObject content
+        let mutable tree = None
+        let parents = ResizeArray<GitHash>()
+        let mutable author = None
+        let mutable committer = None
+        for line in lines do
+            if line.StartsWith "tree " then tree <- Some line.[5..]
+            elif line.StartsWith "parent " then parents.Add line.[7..]
+            elif line.StartsWith "author " then author <- Some(parseSignature line.[7..])
+            elif line.StartsWith "committer " then committer <- Some(parseSignature line.[10..])
+        { Tree = Option.defaultWith (fun () -> failwith "Missing commit tree") tree
+          Parents = parents.ToArray()
+          Author = Option.defaultWith (fun () -> failwith "Missing commit author") author
+          Committer = Option.defaultWith (fun () -> failwith "Missing commit committer") committer
+          Message = message }
     
     let parseTag (data: byte[]) : TagData =
         let header, content = parseHeader data
         if not (header.StartsWith "tag ") then
             failwith $"Not a tag object: {header}"
         
-        let lines = Encoding.UTF8.GetString(content).Split('\n')
-        let rec parseTagLines index (obj: string option) (objType: string option) (tag: string option) (tagger: Signature option) (message: StringBuilder) =
-            if index >= lines.Length then
-                let messageStr = message.ToString().TrimStart()
-                { Object = obj.Value
-                  ObjectType = objType.Value
-                  Tag = tag.Value
-                  Tagger = tagger.Value
-                  Message = messageStr }
-            else
-                let line = lines.[index]
-                if line.StartsWith "object " then
-                    parseTagLines (index + 1) (Some line.[7..]) objType tag tagger message
-                elif line.StartsWith "type " then
-                    parseTagLines (index + 1) obj (Some line.[5..]) tag tagger message
-                elif line.StartsWith "tag " then
-                    parseTagLines (index + 1) obj objType (Some line.[4..]) tagger message
-                elif line.StartsWith "tagger " then
-                    let signature = parseSignature line.[7..]
-                    parseTagLines (index + 1) obj objType tag (Some signature) message
-                elif String.IsNullOrWhiteSpace line then
-                    if index + 1 < lines.Length then
-                        message.AppendLine(String.Join("\n", lines.[index + 1..])) |> ignore
-                    parseTagLines lines.Length obj objType tag tagger message
-                else
-                    parseTagLines (index + 1) obj objType tag tagger message
-        
-        parseTagLines 0 None None None None (StringBuilder())
+        let lines, message = parseMessageObject content
+        let mutable obj = None
+        let mutable objType = None
+        let mutable tag = None
+        let mutable tagger = None
+        for line in lines do
+            if line.StartsWith "object " then obj <- Some line.[7..]
+            elif line.StartsWith "type " then objType <- Some line.[5..]
+            elif line.StartsWith "tag " then tag <- Some line.[4..]
+            elif line.StartsWith "tagger " then tagger <- Some(parseSignature line.[7..])
+        { Object = Option.defaultWith (fun () -> failwith "Missing tag object") obj
+          ObjectType = Option.defaultWith (fun () -> failwith "Missing tag type") objType
+          Tag = Option.defaultWith (fun () -> failwith "Missing tag name") tag
+          Tagger = Option.defaultWith (fun () -> failwith "Missing tagger") tagger
+          Message = message }
     
     let parseObject (data: byte[]) : Result<GitObject, string> =
         try

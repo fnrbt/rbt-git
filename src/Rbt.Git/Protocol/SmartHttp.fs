@@ -18,41 +18,26 @@ module SmartHttp =
         let b = PktLine.encodeStr s
         ms.Write(b, 0, b.Length)
 
-    /// Resolve a FULL ref name (e.g. "refs/heads/main" or "HEAD") to a sha,
-    /// following symref chains and consulting packed-refs. (Rbt.Git's
-    /// References.resolveReference expects a refs-relative path and double-counts
-    /// the "refs/" prefix, so we resolve against GitDir directly here.)
-    let rec resolveFull (repo: Repo) (name: string) (depth: int) : GitHash option =
-        if depth > 10 then None
-        else
-            let path = Path.Combine(repo.GitDir, name)
-            if File.Exists path then
-                let c = (File.ReadAllText path).Trim()
-                if c.StartsWith "ref: " then resolveFull repo (c.Substring(5).Trim()) (depth + 1)
-                else Some c
-            else
-                match References.readPackedRefs repo with
-                | Ok arr -> arr |> Array.tryFind (fun (n, _) -> n = name) |> Option.map snd
-                | _ -> None
+    let private snapshot (repo: Repo) (policy: RefPolicy) =
+        References.snapshot repo policy
+        |> Result.defaultWith (fun error -> raise (InvalidDataException error))
 
-    /// Resolved (sha, refname) for every advertised head and tag.
+    let rec resolveFull (repo: Repo) (name: string) (depth: int) : GitHash option =
+        if depth > 10 || (name <> "HEAD" && not (References.isValidName name)) then None
+        else
+            match References.snapshot repo RefPolicy.Replication with
+            | Error _ -> None
+            | Ok refs ->
+                if name = "HEAD" then
+                    match refs.Head with
+                    | Direct hash -> Some hash
+                    | Symbolic target -> Map.tryFind target refs.Refs
+                else Map.tryFind name refs.Refs
+
     let private gatherRefs (repo: Repo) : (GitHash * string) list =
-        let refs = ResizeArray<GitHash * string>()
-        match References.listBranches repo with
-        | Ok bs ->
-            for b in bs do
-                match resolveFull repo ("refs/heads/" + b) 0 with
-                | Some h -> refs.Add(h, "refs/heads/" + b)
-                | None -> ()
-        | _ -> ()
-        match References.listTags repo with
-        | Ok ts ->
-            for t in ts do
-                match resolveFull repo ("refs/tags/" + t) 0 with
-                | Some h -> refs.Add(h, "refs/tags/" + t)
-                | None -> ()
-        | _ -> ()
-        refs |> List.ofSeq |> List.sortBy snd
+        (snapshot repo RefPolicy.Public).Refs
+        |> Map.toList
+        |> List.map (fun (name, hash) -> hash, name)
 
     let private wantsAreAdvertised (repo: Repo) (wants: seq<GitHash>) =
         let advertised = System.Collections.Generic.HashSet<GitHash>(StringComparer.Ordinal)
@@ -61,35 +46,27 @@ module SmartHttp =
             match ReadObjects.readObject repo hash with
             | Ok (GitObject.Tag tag) -> advertised.Add(tag.Object) |> ignore
             | _ -> ()
-        wants
-        |> Seq.forall (fun hash -> Hashing.isValidHash hash && advertised.Contains hash)
+        wants |> Seq.forall (fun hash -> Hashing.isValidHash hash && advertised.Contains hash)
 
     /// Ref advertisement for Git protocol v0/v1 without an HTTP service header.
     /// This is what direct transports such as SSH write immediately after exec.
-    let private advertiseRefsRawWith (repo: Repo) (service: string) (refs: (GitHash * string) list) : byte[] =
+    let private advertiseRefsRawWith (service: string) (refs: (GitHash * string) list) (headTarget: string option) : byte[] =
         use ms = new MemoryStream()
-        let headTarget =
-            match References.readHead repo with
-            | Ok (Symbolic target) -> Some target
-            | _ -> None
         let baseCaps =
             match service with
-            | "git-upload-pack" -> "shallow ofs-delta side-band-64k agent=rbt-git/0.1"
+            | "git-upload-pack" -> "shallow deepen-relative ofs-delta side-band-64k agent=rbt-git/0.1"
             | _ -> "report-status delete-refs ofs-delta agent=rbt-git/0.1"
         let caps =
             match service, headTarget with
-            | "git-upload-pack", Some t -> sprintf "%s symref=HEAD:%s" baseCaps t
+            | "git-upload-pack", Some target -> sprintf "%s symref=HEAD:%s" baseCaps target
             | _ -> baseCaps
-
-        // Advertise HEAD first for upload-pack so the client picks the default branch.
         let entries =
             match service, headTarget with
-            | "git-upload-pack", Some t ->
-                match resolveFull repo t 0 with
-                | Some h -> (h, "HEAD") :: refs
+            | "git-upload-pack", Some target ->
+                match refs |> List.tryFind (fun (_, name) -> name = target) with
+                | Some (hash, _) -> (hash, "HEAD") :: refs
                 | None -> refs
             | _ -> refs
-
         match entries with
         | [] ->
             // No refs yet: advertise the zero id with capabilities^{}.
@@ -103,7 +80,12 @@ module SmartHttp =
 
     /// Ref advertisement for Git protocol v0/v1 without an HTTP service header.
     let advertiseRefsRaw (repo: Repo) (service: string) : byte[] =
-        advertiseRefsRawWith repo service (gatherRefs repo)
+        let refs = snapshot repo RefPolicy.Public
+        let headTarget =
+            match refs.Head with
+            | Symbolic target when Map.containsKey target refs.Refs -> Some target
+            | _ -> None
+        advertiseRefsRawWith service (refs.Refs |> Map.toList |> List.map (fun (name, hash) -> hash, name)) headTarget
 
     /// Body of GET /info/refs?service=<service>.
     let advertiseRefs (repo: Repo) (service: string) : byte[] =
@@ -114,6 +96,27 @@ module SmartHttp =
         ms.Write(body, 0, body.Length)
         ms.ToArray()
 
+    let private effectiveDepth (repo: Repo) (wants: GitHash[]) (clientShallow: seq<GitHash>) (relative: bool) (requested: int) =
+        if not relative || requested <= 0 then requested
+        else
+            let shallow = System.Collections.Generic.HashSet<GitHash>(clientShallow, StringComparer.Ordinal)
+            let seen = System.Collections.Generic.HashSet<GitHash>(StringComparer.Ordinal)
+            let pending = System.Collections.Generic.Queue<GitHash * int>()
+            for hash in wants do pending.Enqueue(hash, 1)
+            let mutable boundary = None
+            while pending.Count > 0 && Option.isNone boundary do
+                let hash, distance = pending.Dequeue()
+                if seen.Add hash then
+                    if shallow.Contains hash then boundary <- Some distance
+                    else
+                        match ReadObjects.readObject repo hash with
+                        | Ok (GitObject.Commit commit) ->
+                            for parent in commit.Parents do pending.Enqueue(parent, distance + 1)
+                        | Ok (GitObject.Tag tag) -> pending.Enqueue(tag.Object, distance)
+                        | _ -> ()
+            match boundary with
+            | Some distance when requested <= Int32.MaxValue - distance -> requested + distance
+            | _ -> requested
     /// Stream the body of POST /git-upload-pack (clone/fetch) directly to `output`:
     /// the shallow boundary (when deepen), "NAK", then the packfile (side-band
     /// framed when negotiated). Streaming keeps memory bounded for large repos.
@@ -126,38 +129,57 @@ module SmartHttp =
         let haves = ResizeArray<GitHash>()
         let mutable caps = ""
         let mutable depth = 0
+        let clientShallow = System.Collections.Generic.HashSet<GitHash>(StringComparer.Ordinal)
         let mutable p = 0
         let mutable doneSeen = false
-        while p < reqBody.Length && not doneSeen do
-            match PktLine.read reqBody p with
-            | PktLine.Flush, np | PktLine.Delim, np -> p <- np
-            | PktLine.Data d, np ->
-                p <- np
-                let s = Encoding.UTF8.GetString d
-                if s.StartsWith "want " && s.Length >= 45 then
-                    wants.Add(s.Substring(5, 40))
-                    if caps = "" && s.Length > 45 then caps <- s.Substring(45)
-                elif s.StartsWith "have " && s.Length >= 45 then haves.Add(s.Substring(5, 40))
-                elif s.StartsWith "deepen " then
-                    match Int32.TryParse(s.Substring(7).Trim()) with
-                    | true, n -> depth <- n
-                    | _ -> ()
-                elif s.StartsWith "done" then doneSeen <- true
-        if wants.Count = 0 then Error "no wants in upload-pack request"
+        let mutable sawFlush = false
+        let parseError =
+            try
+                while p < reqBody.Length && not doneSeen do
+                    match PktLine.read reqBody p with
+                    | PktLine.Flush, np -> p <- np; sawFlush <- true
+                    | PktLine.Delim, _ -> raise (InvalidDataException "Unexpected upload-pack delimiter")
+                    | PktLine.Data d, np ->
+                        p <- np
+                        let s = Encoding.UTF8.GetString d
+                        if s.StartsWith "want " && s.Length >= 45 then
+                            wants.Add(s.Substring(5, 40))
+                            if caps = "" && s.Length > 45 then caps <- s.Substring(45)
+                        elif s.StartsWith "have " && s.Length >= 45 && Hashing.isValidHash(s.Substring(5, 40)) then haves.Add(s.Substring(5, 40))
+                        elif s.StartsWith "shallow " && s.Length >= 48 && Hashing.isValidHash(s.Substring(8, 40)) then clientShallow.Add(s.Substring(8, 40)) |> ignore
+                        elif s.StartsWith "deepen " then
+                            match Int32.TryParse(s.Substring(7).Trim()) with
+                            | true, n when n > 0 -> depth <- n
+                            | _ -> raise (InvalidDataException "Invalid deepen depth")
+                        elif s = "done\n" then doneSeen <- true
+                        else raise (InvalidDataException "Invalid upload-pack request line")
+                if not sawFlush then Some "Missing upload-pack flush"
+                elif doneSeen && p <> reqBody.Length then Some "Unexpected data after done"
+                else None
+            with :? InvalidDataException as error -> Some error.Message
+        if Option.isSome parseError then Error(parseError.Value)
+        elif wants.Count = 0 then Error "no wants in upload-pack request"
         elif not (authorize wants) then Error "want is not reachable from an advertised ref"
         else
             let useDelta = caps.Contains "ofs-delta"
             let useSideband = caps.Contains "side-band-64k"
+            let depth = effectiveDepth repo (wants.ToArray()) clientShallow (caps.Contains "deepen-relative") depth
             if depth > 0 then
                 // Shallow negotiation is two POSTs. POST 1 (wants+deepen+flush, no
                 // "done") gets only the shallow boundary; POST 2 (adds "done") gets
                 // the shallow boundary + NAK + the depth-limited pack.
                 let objs, shallowSet = PackWriter.objectClosureShallow repo (wants.ToArray()) depth
-                for sh in shallowSet do PktLine.writeStr output (sprintf "shallow %s\n" sh)
+                let boundary = Set.ofArray shallowSet
+                for sh in clientShallow do
+                    if Array.contains sh objs && not (boundary.Contains sh) then PktLine.writeStr output (sprintf "unshallow %s\n" sh)
+                for sh in shallowSet do
+                    if not (clientShallow.Contains sh) then PktLine.writeStr output (sprintf "shallow %s\n" sh)
                 PktLine.writeFlush output
                 if doneSeen then
                     PktLine.writeStr output "NAK\n"
                     PackStream.writeTo repo objs useDelta useSideband output
+                elif haves.Count > 0 then
+                    PktLine.writeStr output "NAK\n"
                 Ok()
             elif not doneSeen then
                 // Stateless-HTTP compute round: reply "NAK" and end the response.
@@ -175,22 +197,27 @@ module SmartHttp =
                 // Done round: final NAK then the packfile. objectClosure excludes
                 // history reachable from the haves, so the pack stays incremental
                 // even though we never ACKed a specific common.
-                let objs = PackWriter.objectClosure repo (wants.ToArray()) (haves.ToArray())
+                let commonHaves = haves |> Seq.filter (ReadObjects.objectExists repo) |> Seq.toArray
+                let objs = PackWriter.objectClosure repo (wants.ToArray()) commonHaves
                 PktLine.writeStr output "NAK\n"
                 PackStream.writeTo repo objs useDelta useSideband output
                 Ok()
 
     let uploadPackTo (repo: Repo) (reqBody: byte[]) (output: Stream) : Result<unit, string> =
-        uploadPackToWithAuthorization (wantsAreAdvertised repo) repo reqBody output
+        try uploadPackToWithAuthorization (wantsAreAdvertised repo) repo reqBody output
+        with ex -> Error $"Upload-pack failed: {ex.Message}"
 
     let advertiseRefsForPolicy (repo: Repo) (service: string) (policy: RefPolicy) : Result<byte[], string> =
         References.snapshot repo policy
-        |> Result.map (fun snapshot ->
+        |> Result.map (fun refs ->
             use ms = new MemoryStream()
             w ms (sprintf "# service=%s\n" service)
             PktLine.writeFlush ms
-            let refs = snapshot.Refs |> Map.toList |> List.map (fun (name, hash) -> hash, name)
-            let body = advertiseRefsRawWith repo service refs
+            let headTarget =
+                match refs.Head with
+                | Symbolic target when Map.containsKey target refs.Refs -> Some target
+                | _ -> None
+            let body = advertiseRefsRawWith service (refs.Refs |> Map.toList |> List.map (fun (name, hash) -> hash, name)) headTarget
             ms.Write(body, 0, body.Length)
             ms.ToArray())
 
@@ -199,14 +226,16 @@ module SmartHttp =
         (policy: RefPolicy)
         (reqBody: byte[])
         (output: Stream) : Result<unit, string> =
-        match References.snapshot repo policy with
-        | Error error -> Error error
-        | Ok snapshot ->
-            let allowed = System.Collections.Generic.HashSet<GitHash>(snapshot.Refs.Values, StringComparer.Ordinal)
-            let authorize wants =
-                wants
-                |> Seq.forall (fun hash -> Hashing.isValidHash hash && allowed.Contains hash)
-            uploadPackToWithAuthorization authorize repo reqBody output
+        try
+            match References.snapshot repo policy with
+            | Error error -> Error error
+            | Ok snapshot ->
+                let allowed = System.Collections.Generic.HashSet<GitHash>(snapshot.Refs.Values, StringComparer.Ordinal)
+                let authorize wants =
+                    wants
+                    |> Seq.forall (fun hash -> Hashing.isValidHash hash && allowed.Contains hash)
+                uploadPackToWithAuthorization authorize repo reqBody output
+        with ex -> Error $"Upload-pack failed: {ex.Message}"
 
     /// Buffered convenience wrapper (used by tests); the route streams via uploadPackTo.
     let uploadPack (repo: Repo) (reqBody: byte[]) : Result<byte[], string> =
@@ -219,7 +248,7 @@ module SmartHttp =
     /// can be interactive: the client sends wants, flushes, then may send haves
     /// in rounds before the final done. We advertise no multi_ack capability, so
     /// a simple NAK per negotiation flush is sufficient.
-    let uploadPackStream (repo: Repo) (input: Stream) (output: Stream) : Result<unit, string> =
+    let private uploadPackStreamCore (repo: Repo) (input: Stream) (output: Stream) : Result<unit, string> =
         let wants = ResizeArray<GitHash>()
         let haves = ResizeArray<GitHash>()
         let mutable caps = ""
@@ -227,58 +256,77 @@ module SmartHttp =
         let mutable doneSeen = false
         let mutable eof = false
         let mutable sentShallow = false
-        let mutable sentNak = false
         let mutable invalidWant = false
+        let mutable malformed = false
+        let mutable negotiatingHaves = false
+        let clientShallow = System.Collections.Generic.HashSet<GitHash>(StringComparer.Ordinal)
 
+        let resolvedDepth () = effectiveDepth repo (wants.ToArray()) clientShallow (caps.Contains "deepen-relative") depth
         let shallowInfo () =
             if depth > 0 && not sentShallow then
-                let _, shallowSet = PackWriter.objectClosureShallow repo (wants.ToArray()) depth
-                for sh in shallowSet do PktLine.writeStr output (sprintf "shallow %s\n" sh)
+                let objs, shallowSet = PackWriter.objectClosureShallow repo (wants.ToArray()) (resolvedDepth ())
+                let boundary = Set.ofArray shallowSet
+                for sh in clientShallow do
+                    if Array.contains sh objs && not (boundary.Contains sh) then PktLine.writeStr output (sprintf "unshallow %s\n" sh)
+                for sh in shallowSet do
+                    if not (clientShallow.Contains sh) then PktLine.writeStr output (sprintf "shallow %s\n" sh)
                 PktLine.writeFlush output
                 output.Flush()
                 sentShallow <- true
+        try
+            while not doneSeen && not eof do
+                match PktLine.readFrom input with
+                | Some (PktLine.Data d) ->
+                    let s = Encoding.UTF8.GetString d
+                    if s.StartsWith "want " && s.Length >= 45 then
+                        wants.Add(s.Substring(5, 40))
+                        if caps = "" && s.Length > 45 then caps <- s.Substring(45)
+                    elif s.StartsWith "have " && s.Length >= 45 && Hashing.isValidHash(s.Substring(5, 40)) then
+                        haves.Add(s.Substring(5, 40))
+                        negotiatingHaves <- true
+                    elif s.StartsWith "shallow " && s.Length >= 48 && Hashing.isValidHash(s.Substring(8, 40)) then clientShallow.Add(s.Substring(8, 40)) |> ignore
+                    elif s.StartsWith "deepen " then
+                        match Int32.TryParse(s.Substring(7).Trim()) with
+                        | true, n when n > 0 -> depth <- n
+                        | _ -> malformed <- true
+                    elif s = "done\n" then doneSeen <- true
+                    else malformed <- true
+                | Some PktLine.Flush ->
+                    if wants.Count > 0 then
+                        if wantsAreAdvertised repo wants then
+                            shallowInfo()
+                            if negotiatingHaves then
+                                PktLine.writeStr output "NAK\n"
+                                output.Flush()
+                                negotiatingHaves <- false
+                        else
+                            invalidWant <- true
+                            doneSeen <- true
+                | Some PktLine.Delim -> malformed <- true
+                | None -> eof <- true
+        with :? InvalidDataException -> malformed <- true
 
-        while not doneSeen && not eof do
-            match PktLine.readFrom input with
-            | Some (PktLine.Data d) ->
-                let s = Encoding.UTF8.GetString d
-                if s.StartsWith "want " && s.Length >= 45 then
-                    wants.Add(s.Substring(5, 40))
-                    if caps = "" && s.Length > 45 then caps <- s.Substring(45)
-                elif s.StartsWith "have " && s.Length >= 45 then
-                    haves.Add(s.Substring(5, 40))
-                elif s.StartsWith "deepen " then
-                    match Int32.TryParse(s.Substring(7).Trim()) with
-                    | true, n -> depth <- n
-                    | _ -> ()
-                elif s.StartsWith "done" then
-                    doneSeen <- true
-            | Some PktLine.Flush ->
-                if wants.Count > 0 && not doneSeen then
-                    if wantsAreAdvertised repo wants then
-                        shallowInfo()
-                        PktLine.writeStr output "NAK\n"
-                        output.Flush()
-                        sentNak <- true
-                    else
-                        invalidWant <- true
-                        doneSeen <- true
-            | Some PktLine.Delim -> ()
-            | None -> eof <- true
-
-        if wants.Count = 0 then Ok()
+        if malformed then Error "Malformed upload-pack request"
+        elif wants.Count = 0 then Error "no wants in upload-pack request"
         elif invalidWant || not (wantsAreAdvertised repo wants) then
             Error "want is not reachable from an advertised ref"
+        elif not doneSeen then Error "upload-pack request ended before done"
         else
             shallowInfo()
-            if not sentNak then PktLine.writeStr output "NAK\n"
+            PktLine.writeStr output "NAK\n"
             let useDelta = caps.Contains "ofs-delta"
             let useSideband = caps.Contains "side-band-64k"
             let objs =
-                if depth > 0 then fst (PackWriter.objectClosureShallow repo (wants.ToArray()) depth)
-                else PackWriter.objectClosure repo (wants.ToArray()) (haves.ToArray())
+                if depth > 0 then fst (PackWriter.objectClosureShallow repo (wants.ToArray()) (resolvedDepth ()))
+                else
+                    let commonHaves = haves |> Seq.filter (ReadObjects.objectExists repo) |> Seq.toArray
+                    PackWriter.objectClosure repo (wants.ToArray()) commonHaves
             PackStream.writeTo repo objs useDelta useSideband output
             Ok()
+
+    let uploadPackStream (repo: Repo) (input: Stream) (output: Stream) : Result<unit, string> =
+        try uploadPackStreamCore repo input output
+        with ex -> Error $"Upload-pack failed: {ex.Message}"
 
     /// Push policy. ProtectedRefs may not be force-updated or deleted (typically
     /// the default branch). AllowNonFastForward governs force-push on other refs;
@@ -306,102 +354,130 @@ module SmartHttp =
     let receivePackStreamWith (repo: Repo) (options: ReceiveOptions) (input: Stream) (output: Stream) : unit =
         let buf = new BufferedStream(input)
         let commands = ResizeArray<string * string * string>()
+        let mutable malformed = false
         let mutable flushed = false
-        while not flushed do
-            match PktLine.readFrom buf with
-            | Some (PktLine.Data data) ->
-                let raw = Encoding.UTF8.GetString data
-                let line = (let index = raw.IndexOf('\000') in if index >= 0 then raw.Substring(0, index) else raw).TrimEnd('\n')
-                match line.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
-                | [| oldSha; newSha; refName |] -> commands.Add(oldSha.ToLowerInvariant(), newSha.ToLowerInvariant(), refName)
-                | _ -> ()
-            | Some PktLine.Delim -> ()
-            | Some PktLine.Flush -> flushed <- true
-            | None -> flushed <- true
+        try
+            while not flushed do
+                match PktLine.readFrom buf with
+                | Some (PktLine.Data data) ->
+                    let raw = Encoding.UTF8.GetString data
+                    let line = (let index = raw.IndexOf('\000') in if index >= 0 then raw.Substring(0, index) else raw).TrimEnd('\n')
+                    match line.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
+                    | [| oldSha; newSha; refName |] ->
+                        if not (Hashing.isValidHash oldSha && Hashing.isValidHash newSha && References.isValidName refName) then malformed <- true
+                        else commands.Add(oldSha.ToLowerInvariant(), newSha.ToLowerInvariant(), refName)
+                    | _ -> malformed <- true
+                | Some PktLine.Flush -> flushed <- true
+                | Some PktLine.Delim | None -> malformed <- true; flushed <- true
+        with :? InvalidDataException -> malformed <- true
 
         lock (lockFor repo) (fun () ->
-            let mutable unpackStatus = "ok"
-            let needsPack = commands |> Seq.exists (fun (_, newSha, _) -> newSha <> zeroId)
-            let mutable introducedObjects: GitHash[] = [||]
+            let results = ResizeArray<string * string>()
+            let mutable unpackStatus = if malformed || commands.Count = 0 then "invalid ref command" else "ok"
+            let refsBefore = References.snapshot repo RefPolicy.Replication
+            match refsBefore with
+            | Error error when unpackStatus = "ok" -> unpackStatus <- error
+            | _ -> ()
             let quarantinePath = repo.GitDir + ".quarantine-" + Guid.NewGuid().ToString("N")
             try
-                if needsPack then
+                if unpackStatus = "ok" then
                     match Repository.initBare quarantinePath with
                     | Error error -> unpackStatus <- error
                     | Ok quarantine ->
-                        use counting = new PackData.CountingStream(buf)
-                        match PackWriter.unpackPackStreamInto repo quarantine counting with
-                        | Error error -> unpackStatus <- error
-                        | Ok written ->
-                            match PackWriter.promoteLooseObjects quarantine repo written with
-                            | Ok () -> introducedObjects <- written
+                        let mutable introduced: GitHash[] = [||]
+                        if commands |> Seq.exists (fun (_, newSha, _) -> newSha <> zeroId) then
+                            use counting = new PackData.CountingStream(buf)
+                            match PackWriter.unpackPackStreamInto repo quarantine counting with
                             | Error error -> unpackStatus <- error
+                            | Ok written -> introduced <- written
 
-                let isProtected refName = List.contains refName options.ProtectedRefs
-                let results = ResizeArray<string * string>()
-                for oldSha, newSha, refName in commands do
-                    let validIds = Hashing.isValidHash oldSha && Hashing.isValidHash newSha
-                    let current = resolveFull repo refName 0 |> Option.defaultValue zeroId
-                    if unpackStatus <> "ok" then
-                        results.Add(refName, "ng unpacker error")
-                    elif not validIds || not (References.isValidName refName) then
-                        results.Add(refName, "ng invalid ref command")
-                    elif current <> oldSha then
-                        results.Add(refName, "ng fetch first")
-                    elif newSha = zeroId then
-                        if isProtected refName then results.Add(refName, "ng protected ref")
-                        else results.Add(refName, "ok")
-                    elif not (ReadObjects.objectExists repo newSha) then
-                        results.Add(refName, "ng missing object")
-                    else
-                        let isFastForward =
-                            oldSha = zeroId
-                            || (match CommitHistory.isAncestor repo oldSha newSha with Ok true -> true | _ -> false)
-                        if not isFastForward
-                           && (not options.AllowNonFastForward
-                               || (isProtected refName && not options.AllowProtectedRefRewrite)) then
-                            results.Add(refName, "ng non-fast-forward")
-                        else
-                            results.Add(refName, "ok")
+                        let introducedSet = System.Collections.Generic.HashSet<GitHash>(introduced, StringComparer.Ordinal)
+                        let readObject hash =
+                            if introducedSet.Contains hash then ReadObjects.readObject quarantine hash
+                            else ReadObjects.readObject repo hash
 
-                if results |> Seq.exists (fun (_, status) -> status = "ok") then
-                    let updatedTips =
-                        seq {
+                        let isAncestor oldSha newSha =
+                            let seen = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+                            let pending = System.Collections.Generic.Stack<string>()
+                            pending.Push newSha
+                            let mutable found = false
+                            while pending.Count > 0 && not found do
+                                let hash = pending.Pop()
+                                if hash = oldSha then found <- true
+                                elif seen.Add hash then
+                                    match readObject hash with
+                                    | Ok (GitObject.Commit commit) ->
+                                        for parent in commit.Parents do pending.Push parent
+                                    | _ -> ()
+                            found
+
+                        for oldSha, newSha, refName in commands do
+                            let current =
+                                match refsBefore with
+                                | Ok refs -> Map.tryFind refName refs.Refs |> Option.defaultValue zeroId
+                                | Error _ -> zeroId
+                            let status =
+                                if unpackStatus <> "ok" then "ng unpacker error"
+                                elif current <> oldSha then "ng fetch first"
+                                elif newSha = zeroId then
+                                    if List.contains refName options.ProtectedRefs then "ng protected ref" else "ok"
+                                else
+                                    match readObject newSha with
+                                    | Error _ -> "ng missing object"
+                                    | Ok objectValue when
+                                        (refName.StartsWith("refs/heads/", StringComparison.Ordinal) ||
+                                         refName.StartsWith("refs/remotes/", StringComparison.Ordinal)) &&
+                                        (match objectValue with GitObject.Commit _ -> false | _ -> true) ->
+                                        "ng branch must target commit"
+                                    | Ok _ ->
+                                        let isFastForward = oldSha = zeroId || isAncestor oldSha newSha
+                                        if not isFastForward &&
+                                           (not options.AllowNonFastForward ||
+                                            (List.contains refName options.ProtectedRefs && not options.AllowProtectedRefRewrite)) then
+                                            "ng non-fast-forward"
+                                        else "ok"
+                            results.Add(refName, status)
+
+                        let acceptedTips =
+                            seq {
+                                for index in 0 .. commands.Count - 1 do
+                                    let _, hash, _ = commands.[index]
+                                    if hash <> zeroId && snd results.[index] = "ok" then yield hash
+                            }
+                            |> Seq.toArray
+                        if results |> Seq.exists (fun (_, status) -> status = "ok") then
+                            match Fsck.verifyIntroducedOverlay repo quarantine acceptedTips introduced with
+                            | Error error -> unpackStatus <- error
+                            | Ok report when not report.IsValid -> unpackStatus <- "introduced object validation failed"
+                            | Ok _ ->
+                                if acceptedTips.Length > 0 then
+                                    match PackWriter.promoteLooseObjects quarantine repo introduced with
+                                    | Error error -> unpackStatus <- error
+                                    | Ok () -> ()
+                            if unpackStatus <> "ok" then
+                                for index in 0 .. results.Count - 1 do
+                                    let name, status = results.[index]
+                                    if status = "ok" then results.[index] <- name, "ng repository integrity error"
+
+                        if unpackStatus = "ok" then
                             for index in 0 .. commands.Count - 1 do
-                                let _, newSha, _ = commands.[index]
+                                let oldSha, newSha, refName = commands.[index]
                                 let _, status = results.[index]
-                                if status = "ok" && newSha <> zeroId then yield newSha
-                        }
-                    match Fsck.verifyIntroduced repo updatedTips introducedObjects with
-                    | Error error ->
-                        unpackStatus <- error
-                        for index in 0 .. results.Count - 1 do
-                            let refName, status = results.[index]
-                            if status = "ok" then results.[index] <- refName, "ng repository integrity error"
-                    | Ok report when not report.IsValid ->
-                        unpackStatus <- "introduced object validation failed"
-                        for index in 0 .. results.Count - 1 do
-                            let refName, status = results.[index]
-                            if status = "ok" then results.[index] <- refName, "ng repository integrity error"
-                    | Ok _ -> ()
+                                if status = "ok" then
+                                    let oldValue = if oldSha = zeroId then None else Some oldSha
+                                    let newValue = if newSha = zeroId then None else Some newSha
+                                    match References.compareAndSwap repo refName oldValue newValue with
+                                    | Ok () -> ()
+                                    | Error error -> results.[index] <- refName, "ng " + error
 
-                for index in 0 .. commands.Count - 1 do
-                    let _, newSha, refName = commands.[index]
-                    let _, status = results.[index]
-                    if status = "ok" then
-                        let applied =
-                            if newSha = zeroId then References.deleteAtomic repo refName
-                            else References.writeDirectAtomic repo refName newSha
-                        match applied with
-                        | Ok () -> ()
-                        | Error error -> results.[index] <- refName, "ng " + error
-
-                match References.readHead repo with
-                | Ok (Symbolic target) when not (File.Exists(Path.Combine(repo.GitDir, target))) ->
-                    match References.listBranches repo with
-                    | Ok [| only |] -> References.updateHead repo (Symbolic("refs/heads/" + only)) |> ignore
-                    | _ -> ()
-                | _ -> ()
+                        if unpackStatus = "ok" then
+                            match References.readHead repo, References.snapshot repo RefPolicy.Public with
+                            | Ok (Symbolic target), Ok refs when not (Map.containsKey target refs.Refs) ->
+                                let branches = refs.Refs |> Map.toList |> List.filter (fun (name, _) -> name.StartsWith("refs/heads/", StringComparison.Ordinal))
+                                match branches with
+                                | [ name, _ ] -> References.updateHead repo (Symbolic name) |> ignore
+                                | _ -> ()
+                            | _ -> ()
 
                 PktLine.writeStr output (sprintf "unpack %s\n" unpackStatus)
                 for refName, status in results do
@@ -463,6 +539,8 @@ module SmartHttp =
                 let s = (Encoding.UTF8.GetString d).TrimEnd('\n')
                 if s.StartsWith "command=" then command <- s.Substring 8
                 elif afterDelim then args.Add s
+        if not stop || p <> reqBody.Length || not afterDelim then
+            raise (InvalidDataException "Malformed v2 request")
         command, List.ofSeq args
 
     let private lsRefsV2 (repo: Repo) (args: string list) : byte[] =
@@ -472,18 +550,20 @@ module SmartHttp =
         let prefixes = args |> List.choose (fun a -> if a.StartsWith "ref-prefix " then Some(a.Substring 11) else None)
         let matches (name: string) = List.isEmpty prefixes || prefixes |> List.exists (fun pre -> name.StartsWith pre)
         use ms = new MemoryStream()
-        (match References.readHead repo with
-         | Ok (Symbolic target) when matches "HEAD" ->
-             match resolveFull repo target 0 with
+        let refs = snapshot repo RefPolicy.Public
+        (match refs.Head with
+         | Symbolic target when matches "HEAD" ->
+             match Map.tryFind target refs.Refs with
              | Some sha ->
                  let line = sprintf "%s HEAD" sha
                  w ms ((if wantSymrefs then line + sprintf " symref-target:%s" target else line) + "\n")
-             | None when wantUnborn ->
+             | None when wantUnborn && target.StartsWith("refs/heads/", StringComparison.Ordinal) &&
+                         not (Map.containsKey target (snapshot repo RefPolicy.Replication).Refs) ->
                  let line = "unborn HEAD"
                  w ms ((if wantSymrefs then line + sprintf " symref-target:%s" target else line) + "\n")
              | None -> ()
          | _ -> ())
-        for (sha, name) in gatherRefs repo do
+        for (name, sha) in Map.toList refs.Refs do
             if matches name then
                 let mutable line = sprintf "%s %s" sha name
                 if wantPeel then
@@ -499,12 +579,25 @@ module SmartHttp =
             args |> List.choose (fun argument -> if argument.StartsWith prefix then Some(argument.Substring(prefix.Length).Trim()) else None)
         let wants =
             pick "want "
-            |> List.choose (fun value -> if value.Length >= 40 then Some(value.Substring(0, 40)) else None)
             |> List.toArray
-        let haves =
-            pick "have "
-            |> List.choose (fun value -> if value.Length >= 40 then Some(value.Substring(0, 40)) else None)
-        if wants.Length = 0 then
+        let haves = pick "have "
+        let malformedIds =
+            args
+            |> List.exists (fun argument ->
+                [ "want "; "have "; "shallow " ]
+                |> List.exists (fun prefix ->
+                    if argument.StartsWith(prefix, StringComparison.Ordinal) then
+                        not (Hashing.isValidHash(argument.Substring(prefix.Length)))
+                    else false))
+        let malformedDepth =
+            args |> List.exists (fun argument ->
+                if argument.StartsWith("deepen ", StringComparison.Ordinal) then
+                    match Int32.TryParse(argument.Substring(7).Trim()) with
+                    | true, depth when depth > 0 -> false
+                    | _ -> true
+                else false)
+        if malformedIds || malformedDepth then Error "Malformed fetch request"
+        elif wants.Length = 0 then
             Error "no wants in fetch request"
         elif not (wantsAreAdvertised repo wants) then
             Error "want is not reachable from an advertised ref"
@@ -522,10 +615,14 @@ module SmartHttp =
                 |> Option.defaultValue 0
             let clientShallow = pick "shallow " |> Set.ofList
 
+            let depth = effectiveDepth repo wants clientShallow (List.contains "deepen-relative" args) depth
             let writeShallowInfo () =
                 if depth > 0 then
-                    let _, shallowSet = PackWriter.objectClosureShallow repo wants depth
+                    let objs, shallowSet = PackWriter.objectClosureShallow repo wants depth
+                    let boundary = Set.ofArray shallowSet
                     PktLine.writeStr output "shallow-info\n"
+                    for shallow in clientShallow do
+                        if Array.contains shallow objs && not (boundary.Contains shallow) then PktLine.writeStr output (sprintf "unshallow %s\n" shallow)
                     for shallow in shallowSet do
                         if not (clientShallow.Contains shallow) then PktLine.writeStr output (sprintf "shallow %s\n" shallow)
                     PktLine.writeDelim output
@@ -534,7 +631,7 @@ module SmartHttp =
                 PktLine.writeStr output "packfile\n"
                 let objects =
                     if depth > 0 then fst (PackWriter.objectClosureShallow repo wants depth)
-                    else PackWriter.objectClosure repo wants (List.toArray haves)
+                    else PackWriter.objectClosure repo wants (haves |> List.filter (ReadObjects.objectExists repo) |> List.toArray)
                 PackStream.writeTo repo objects useDelta true output
 
             if doneSeen || List.isEmpty haves then
@@ -556,10 +653,14 @@ module SmartHttp =
 
     /// Dispatch a v2 command POST (ls-refs / fetch), streaming to `output`.
     let uploadPackV2To (repo: Repo) (reqBody: byte[]) (output: Stream) : Result<unit, string> =
-        match parseV2Request reqBody with
-        | "ls-refs", args ->
-            let b = lsRefsV2 repo args
-            output.Write(b, 0, b.Length)
-            Ok()
-        | "fetch", args -> fetchV2To repo args output
-        | other, _ -> Error(sprintf "unsupported v2 command: %s" other)
+        try
+            match parseV2Request reqBody with
+            | "ls-refs", args ->
+                let b = lsRefsV2 repo args
+                output.Write(b, 0, b.Length)
+                Ok()
+            | "fetch", args -> fetchV2To repo args output
+            | other, _ -> Error(sprintf "unsupported v2 command: %s" other)
+        with
+        | :? InvalidDataException as error -> Error error.Message
+        | ex -> Error $"Upload-pack failed: {ex.Message}"

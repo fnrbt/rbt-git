@@ -46,9 +46,10 @@ module PathUtils =
         let normalizedBase = normalizeGitPath basePath
         let normalizedTarget = normalizeGitPath targetPath
         
-        if isSubPath normalizedBase normalizedTarget then
-            let relative = normalizedTarget.[normalizedBase.Length + 1..]
-            Some relative
+        if normalizedBase = normalizedTarget then
+            Some ""
+        elif isSubPath normalizedBase normalizedTarget then
+            Some normalizedTarget.[normalizedBase.Length + 1..]
         else
             None
     

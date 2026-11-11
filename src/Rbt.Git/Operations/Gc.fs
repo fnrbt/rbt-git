@@ -131,10 +131,11 @@ module Gc =
     let buildPack (repo: Repo) (objectIds: GitHash[]) (useDelta: bool) : byte[] * (GitHash * int * uint32)[] =
         let objs =
             objectIds
-            |> Array.choose (fun h ->
+            |> Array.map (fun h ->
                 match ReadObjects.readRawObject repo h with
-                | Ok (t, c) -> Some(h, t, c)
-                | Error _ -> None)
+                | Ok (t, c) when Hashing.hashRaw t c = h -> (h, t, c)
+                | Ok _ -> failwithf "object %s has an incorrect hash" h
+                | Error error -> failwithf "reading %s: %s" h error)
         let ordered =
             if useDelta then objs |> Array.sortBy (fun (_, t, c) -> (PackData.typeNum t, -c.Length))
             else objs
@@ -210,42 +211,67 @@ module Gc =
         else
             [ for sub in Directory.GetDirectories od do
                 let name = Path.GetFileName sub
-                if name.Length = 2 then
+                if name.Length = 2 && (name |> Seq.forall Uri.IsHexDigit) then
                     for f in Directory.GetFiles sub do
-                        yield name + Path.GetFileName f ]
+                        let fileName = Path.GetFileName f
+                        if fileName.Length = 38 && (fileName |> Seq.forall Uri.IsHexDigit) then
+                            yield name + fileName ]
 
     let private packedHashes (repo: Repo) : GitHash list =
         [ for (name, _) in Repository.packFilesExist repo do
             match PackParser.readPackIndex (Repository.getPackIndexPath repo name) with
             | Ok idx -> yield! (idx.Objects |> Array.map (fun o -> o.Hash))
-            | Error _ -> () ]
+            | Error error -> failwithf "cannot read pack index %s: %s" name error ]
 
     /// Collapse all loose objects and existing packs into a single delta-compressed
     /// packfile, then delete the loose objects and superseded packs. Returns the
     /// number of objects packed.
     let repack (repo: Repo) : Result<int, string> =
         try
-            let all = (looseHashes repo @ packedHashes repo) |> List.distinct |> List.toArray
-            if all.Length = 0 then Ok 0
-            else
-                let pack, entries = buildPack repo all true
-                let packSha = pack.[pack.Length - 20 ..]
-                let idx = writeIdx entries packSha
-                let nameHex = BitConverter.ToString(packSha).Replace("-", "").ToLowerInvariant()
-                let packName = "pack-" + nameHex
-                let packDir = Repository.getPackDir repo
-                Directory.CreateDirectory packDir |> ignore
-                File.WriteAllBytes(Path.Combine(packDir, packName + ".pack"), pack)
-                File.WriteAllBytes(Path.Combine(packDir, packName + ".idx"), idx)
-                // delete superseded packs (everything but the new one)
-                for f in Directory.GetFiles(packDir) do
-                    let bn = Path.GetFileNameWithoutExtension f
-                    if bn <> packName then File.Delete f
-                // delete loose objects (now all in the pack)
-                let od = Repository.getObjectsDir repo
-                for sub in Directory.GetDirectories od do
-                    if (Path.GetFileName sub).Length = 2 then
-                        for f in Directory.GetFiles sub do File.Delete f
-                        try Directory.Delete sub with _ -> ()
-                Ok all.Length
+            let packDir = Repository.getPackDir repo
+            Directory.CreateDirectory packDir |> ignore
+            let lockPath = Path.Combine(packDir, "rbt-gc.lock")
+            use gcLock = new FileStream(lockPath, FileMode.CreateNew, FileAccess.Write, FileShare.None)
+            try
+                let loose = looseHashes repo
+                let oldPacks = Repository.packFilesExist repo
+                for (name, path) in oldPacks do
+                    match Fsck.verifyPackPair repo (Repository.getPackIndexPath repo name) path with
+                    | [] -> ()
+                    | issues -> failwithf "invalid pack %s: %s" name issues.Head.Message
+                let all = (loose @ packedHashes repo) |> List.distinct |> List.toArray
+                if all.Length = 0 then Ok 0
+                else
+                    let pack, entries = buildPack repo all true
+                    let packSha = pack.[pack.Length - 20 ..]
+                    let idx = writeIdx entries packSha
+                    let nameHex = BitConverter.ToString(packSha).Replace("-", "").ToLowerInvariant()
+                    let packName = "pack-" + nameHex
+                    let packPath = Path.Combine(packDir, packName + ".pack")
+                    let idxPath = Path.Combine(packDir, packName + ".idx")
+                    let suffix = ".tmp-" + Guid.NewGuid().ToString("N")
+                    let tempPack = packPath + suffix
+                    let tempIdx = idxPath + suffix
+                    try
+                        File.WriteAllBytes(tempPack, pack)
+                        File.WriteAllBytes(tempIdx, idx)
+                        if File.Exists packPath then
+                            if File.ReadAllBytes(packPath) <> pack then failwith "existing pack differs from generated pack"
+                        else File.Move(tempPack, packPath, false)
+                        if File.Exists idxPath then
+                            if File.ReadAllBytes(idxPath) <> idx then failwith "existing index differs from generated index"
+                        else File.Move(tempIdx, idxPath, false)
+                    finally
+                        if File.Exists tempPack then File.Delete tempPack
+                        if File.Exists tempIdx then File.Delete tempIdx
+                    for (name, path) in oldPacks do
+                        if name <> packName then
+                            File.Delete(Repository.getPackIndexPath repo name)
+                            File.Delete path
+                    for hash in loose do
+                        File.Delete(Repository.getLooseObjectPath repo hash)
+                    Ok all.Length
+            finally
+                gcLock.Dispose()
+                File.Delete lockPath
         with ex -> Error $"repack failed: {ex.Message}"

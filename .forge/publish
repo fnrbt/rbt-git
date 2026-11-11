@@ -67,6 +67,16 @@ def main() -> int:
         "</configuration>\n",
         encoding="utf-8",
     )
+    # Restore against the explicit source, then run the executable regression
+    # harness. Any failure aborts before pack or upload.
+    test_project = "tests/Rbt.Git.Tests/Rbt.Git.Tests.fsproj"
+    restore = ["dotnet", "restore", test_project, "--configfile", str(nuget_config)]
+    print("+ " + " ".join(restore), flush=True)
+    subprocess.run(restore, check=True, cwd=repo)
+    tests = ["dotnet", "run", "--project", test_project, "-c", "Release", "--no-restore"]
+    print("+ " + " ".join(tests), flush=True)
+    subprocess.run(tests, check=True, cwd=repo)
+
 
     output = workdir / "nupkg"
     project = "src/Rbt.Git/Rbt.Git.fsproj"

@@ -9,145 +9,124 @@ module CommitHistory =
         | Ok commitData -> Ok commitData.Parents
         | Error msg -> Error msg
     
-    let rec private walkCommitsInternal (repo: Repo) (visited: HashSet<GitHash>) (queue: ResizeArray<GitHash>) : seq<CommitData * GitHash> =
-        seq {
-            if queue.Count > 0 then
-                let current = queue.[0]
-                queue.RemoveAt(0) |> ignore
-                
-                if not (visited.Contains current) then
-                    visited.Add current |> ignore
-                    
-                    match ReadObjects.readCommit repo current with
-                    | Ok commit ->
-                        yield (commit, current)
-                        
-                        for parent in commit.Parents do
-                            if not (visited.Contains parent) then
-                                queue.Add parent
-                        
-                        yield! walkCommitsInternal repo visited queue
-                    | _ -> ()
-        }
-    
+    /// Stream one commit at a time. A bounded caller need not read the whole
+    /// repository, but any failed read actually reached must throw.
     let walkCommits (repo: Repo) (start: GitHash) : seq<CommitData * GitHash> =
-        let visited = HashSet()
-        let queue = ResizeArray()
-        queue.Add start
-        walkCommitsInternal repo visited queue
-    
-    let rec private isAncestorInternal (repo: Repo) (ancestor: GitHash) (descendant: GitHash) (visited: HashSet<GitHash>) : Result<bool, string> =
-        if ancestor = descendant then
-            Ok true
-        elif visited.Contains descendant then
-            Ok false
-        else
-            visited.Add descendant |> ignore
-            match getParents repo descendant with
-            | Ok parents ->
-                if Array.isEmpty parents then
-                    Ok false
-                else
-                    let results = parents |> Array.map (fun p -> isAncestorInternal repo ancestor p visited)
-                    match results |> Array.tryFind (fun r -> match r with Ok true -> true | _ -> false) with
-                    | Some (Ok true) -> Ok true
-                    | _ -> Ok false
-            | Error msg -> Error msg
-    
+        seq {
+            let visited = HashSet<GitHash>()
+            let pending = Queue<GitHash>()
+            pending.Enqueue start
+            while pending.Count > 0 do
+                let hash = pending.Dequeue()
+                if visited.Add hash then
+                    match ReadObjects.readCommit repo hash with
+                    | Error message -> invalidOp message
+                    | Ok commit ->
+                        yield commit, hash
+                        for parent in commit.Parents do
+                            if not (visited.Contains parent) then pending.Enqueue parent
+        }
+
+    /// Complete walks return errors explicitly, rather than a partial history.
+    let walkCommitsResult (repo: Repo) (start: GitHash) : Result<(CommitData * GitHash)[], string> =
+        try Ok (walkCommits repo start |> Seq.toArray)
+        with :? System.InvalidOperationException as ex -> Error ex.Message
+
+    let private collectGraph (repo: Repo) (start: GitHash) : Result<Dictionary<GitHash, GitHash[]>, string> =
+        let graph = Dictionary<GitHash, GitHash[]>()
+        let pending = Stack<GitHash>()
+        pending.Push start
+        let mutable error = None
+        while pending.Count > 0 && error.IsNone do
+            let hash = pending.Pop()
+            if not (graph.ContainsKey hash) then
+                match getParents repo hash with
+                | Error message -> error <- Some message
+                | Ok parents ->
+                    graph.Add(hash, parents)
+                    for parent in parents do
+                        if not (graph.ContainsKey parent) then pending.Push parent
+        match error with
+        | Some message -> Error message
+        | None -> Ok graph
+
     let isAncestor (repo: Repo) (ancestor: GitHash) (descendant: GitHash) : Result<bool, string> =
-        if ancestor = descendant then
-            Ok true
+        let seen = HashSet<GitHash>()
+        let pending = Queue<GitHash>()
+        pending.Enqueue descendant
+        let mutable error = None
+        let mutable found = false
+        while pending.Count > 0 && not found do
+            let hash = pending.Dequeue()
+            if hash = ancestor then found <- true
+            elif seen.Add hash then
+                match getParents repo hash with
+                | Error message -> if error.IsNone then error <- Some message
+                | Ok parents ->
+                    for parent in parents do
+                        if not (seen.Contains parent) then pending.Enqueue parent
+        if found then Ok true
         else
-            isAncestorInternal repo ancestor descendant (HashSet())
-    
-    let rec private collectAncestors (repo: Repo) (commit: GitHash) (visited: HashSet<GitHash>) : Result<HashSet<GitHash>, string> =
-        if visited.Contains commit then
-            Ok visited
-        else
-            visited.Add commit |> ignore
-            match getParents repo commit with
-            | Ok parents ->
-                match parents |> Array.fold (fun acc p ->
-                    match acc with
-                    | Ok v -> collectAncestors repo p v
-                    | Error e -> Error e) (Ok visited) with
-                | Ok v -> Ok v
-                | Error msg -> Error msg
-            | Error msg -> Error msg
-    
-    let rec private mergeBaseInternal (repo: Repo) (commits1: ResizeArray<GitHash>) (commits2: ResizeArray<GitHash>) (candidates: HashSet<GitHash * bool * bool>) : Result<GitHash option, string> =
-        if commits1.Count = 0 && commits2.Count = 0 then
-            Ok None
-        else
-            let processCommits (commits: ResizeArray<GitHash>) (isFirst: bool) : Result<unit, string> =
-                if commits.Count > 0 then
-                    let current = commits.[0]
-                    commits.RemoveAt(0) |> ignore
-                    
-                    match candidates |> Seq.tryFind (fun (c, _, _) -> c = current) with
-                    | Some (c, b1, b2) ->
-                        if isFirst && b2 then Ok ()
-                        elif not isFirst && b1 then Ok ()
-                        else
-                            candidates.Remove (c, b1, b2) |> ignore
-                            let newB1 = if isFirst then true else b1
-                            let newB2 = if not isFirst then true else b2
-                            candidates.Add (c, newB1, newB2) |> ignore
-                            Ok ()
-                    | None ->
-                        candidates.Add (current, isFirst, false) |> ignore
-                        match getParents repo current with
-                        | Ok parents -> parents |> Array.iter commits.Add; Ok ()
-                        | Error msg -> Error msg
-                else
-                    Ok ()
-            
-            match processCommits commits1 true with
-            | Ok () -> 
-                match processCommits commits2 false with
-                | Ok () ->
-                    match candidates |> Seq.tryFind (fun (_, b1, b2) -> b1 && b2) with
-                    | Some (c, _, _) -> Ok (Some c)
-                    | None -> mergeBaseInternal repo commits1 commits2 candidates
-                | Error msg -> Error msg
-            | Error msg -> Error msg
-    
+            match error with
+            | Some message -> Error message
+            | None -> Ok false
+
+    let getCommonAncestors (repo: Repo) (commit1: GitHash) (commit2: GitHash) : Result<GitHash[], string> =
+        match collectGraph repo commit1, collectGraph repo commit2 with
+        | Ok left, Ok right ->
+            left.Keys
+            |> Seq.filter right.ContainsKey
+            |> Seq.sort
+            |> Seq.toArray
+            |> Ok
+        | Error message, _ -> Error message
+        | _, Error message -> Error message
+
+    /// Return every best common ancestor. Criss-cross histories can have more
+    /// than one; picking an arbitrary one silently produces an incorrect merge.
+    let lowestMergeBases (repo: Repo) (commit1: GitHash) (commit2: GitHash) : Result<GitHash[], string> =
+        match collectGraph repo commit1, collectGraph repo commit2 with
+        | Ok left, Ok right ->
+            let common = HashSet<GitHash>(left.Keys |> Seq.filter right.ContainsKey)
+            let nonLowest = HashSet<GitHash>()
+            let pending = Queue<GitHash>()
+            for hash in common do
+                for parent in left.[hash] do pending.Enqueue parent
+            while pending.Count > 0 do
+                let hash = pending.Dequeue()
+                if nonLowest.Add hash then
+                    for parent in left.[hash] do pending.Enqueue parent
+            common
+            |> Seq.filter (fun hash -> not (nonLowest.Contains hash))
+            |> Seq.sort
+            |> Seq.toArray
+            |> Ok
+        | Error message, _ -> Error message
+        | _, Error message -> Error message
+
     let mergeBase (repo: Repo) (commit1: GitHash) (commit2: GitHash) : Result<GitHash option, string> =
-        if commit1 = commit2 then
-            Ok (Some commit1)
-        else
-            let commits1 = ResizeArray()
-            let commits2 = ResizeArray()
-            commits1.Add commit1
-            commits2.Add commit2
-            mergeBaseInternal repo commits1 commits2 (HashSet())
+        match lowestMergeBases repo commit1 commit2 with
+        | Ok [||] -> Ok None
+        | Ok [| hash |] -> Ok (Some hash)
+        | Ok bases -> Error (sprintf "Multiple merge bases (%s); recursive merge bases are not supported" (String.concat ", " bases))
+        | Error message -> Error message
     
     let getCommitCount (repo: Repo) (start: GitHash) : int =
         walkCommits repo start |> Seq.length
-    
-    let getCommonAncestors (repo: Repo) (commit1: GitHash) (commit2: GitHash) : Result<GitHash[], string> =
-        match collectAncestors repo commit1 (HashSet()) with
-        | Ok ancestors1 ->
-            match collectAncestors repo commit2 (HashSet()) with
-            | Ok ancestors2 ->
-                let common = Set.intersect (Set.ofSeq ancestors1) (Set.ofSeq ancestors2)
-                Ok (Set.toArray common)
-            | Error msg -> Error msg
-        | Error msg -> Error msg
     
     let getRevList (repo: Repo) (start: GitHash) : GitHash[] =
         walkCommits repo start |> Seq.map snd |> Seq.toArray
     
     let getCommitsBetween (repo: Repo) (baseCommit: GitHash) (headCommit: GitHash) : Result<GitHash[], string> =
-        match isAncestor repo baseCommit headCommit with
-        | Ok true ->
-            let allCommits = walkCommits repo headCommit |> Seq.toArray
-            let ancestorCommits = walkCommits repo baseCommit |> Seq.map fst |> Seq.map (fun c -> Hashing.hashCommit c) |> Set.ofSeq
-            
-            let filtered = 
-                allCommits 
-                |> Array.filter (fun (_, h) -> not (ancestorCommits.Contains h))
-            
-            Ok (filtered |> Array.map snd)
-        | Ok false -> Ok [||]
-        | Error msg -> Error msg
+        match walkCommitsResult repo headCommit with
+        | Error message -> Error message
+        | Ok headCommits ->
+            if not (headCommits |> Array.exists (fun (_, hash) -> hash = baseCommit)) then Ok [||]
+            else
+                match walkCommitsResult repo baseCommit with
+                | Error message -> Error message
+                | Ok baseCommits ->
+                    let excluded = HashSet<GitHash>(baseCommits |> Array.map snd)
+                    headCommits
+                    |> Array.choose (fun (_, hash) -> if excluded.Contains hash then None else Some hash)
+                    |> Ok

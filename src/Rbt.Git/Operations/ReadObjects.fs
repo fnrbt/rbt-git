@@ -45,9 +45,14 @@ module ReadObjects =
                 else
                     let header = System.Text.Encoding.UTF8.GetString(decompressed, 0, nul)
                     let sp = header.IndexOf(' ')
-                    let objType = if sp < 0 then header else header.Substring(0, sp)
                     let content = decompressed.[nul + 1 ..]
-                    Ok (objType, content)
+                    if sp <= 0 then Error $"Invalid object header: {hash}"
+                    else
+                        let objType = header.Substring(0, sp)
+                        let expectedHeader = sprintf "%s %d" objType content.Length
+                        if header <> expectedHeader || Hashing.sha1 decompressed <> hash then
+                            Error $"Invalid object header or hash: {hash}"
+                        else Ok (objType, content)
             else
                 match PackStore.tryRead repo hash with
                 | Some raw -> Ok raw

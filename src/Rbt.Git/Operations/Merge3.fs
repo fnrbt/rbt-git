@@ -4,194 +4,221 @@ open System
 open System.Collections.Generic
 open System.Text
 
-/// Real 3-way merge: a recursive tree merge with per-file resolution, a diff3
-/// line merge for files changed on both sides, conflict detection, and
-/// merge-commit creation. Produces byte-identical trees to canonical git for
-/// clean merges (verified against `git merge-tree`).
+/// Shared three-way tree merge and merge-commit creation.
 module Merge3 =
 
     type MergeOutcome =
-        | Merged of GitHash          // new merge commit
-        | Conflicts of string list   // paths that could not be auto-merged
+        | Merged of GitHash
+        | Conflicts of string list
         | MergeError of string
 
-    // ---- diff3 line merge -------------------------------------------------
+    let private utf8 = UTF8Encoding(false, true)
 
-    let private splitLines (s: string) : string[] =
-        let res = ResizeArray<string>()
+    let private splitLines (text: string) : string[] =
+        let lines = ResizeArray<string>()
         let mutable start = 0
-        for i in 0 .. s.Length - 1 do
-            if s.[i] = '\n' then
-                res.Add(s.Substring(start, i - start + 1))
+        for i = 0 to text.Length - 1 do
+            if text.[i] = '\n' then
+                lines.Add(text.Substring(start, i - start + 1))
                 start <- i + 1
-        if start < s.Length then res.Add(s.Substring start)
-        res.ToArray()
+        if start < text.Length then lines.Add(text.Substring start)
+        lines.ToArray()
 
-    /// Longest common subsequence of two line arrays, as matched index pairs.
-    let private lcsPairs (a: string[]) (b: string[]) : (int * int) list =
-        let n = a.Length
-        let m = b.Length
-        let dp = Array2D.zeroCreate (n + 1) (m + 1)
-        for i in n - 1 .. -1 .. 0 do
-            for j in m - 1 .. -1 .. 0 do
-                dp.[i, j] <-
-                    if a.[i] = b.[j] then dp.[i + 1, j + 1] + 1
-                    else max dp.[i + 1, j] dp.[i, j + 1]
-        let res = ResizeArray<int * int>()
-        let mutable i = 0
-        let mutable j = 0
-        while i < n && j < m do
-            if a.[i] = b.[j] then res.Add(i, j); i <- i + 1; j <- j + 1
-            elif dp.[i + 1, j] >= dp.[i, j + 1] then i <- i + 1
-            else j <- j + 1
-        List.ofSeq res
+    /// Hirschberg's LCS: matched index pairs in order, using linear
+    /// auxiliary space instead of a quadratic matrix.
+    let internal lineMatches (a: string[]) (b: string[]) : (int * int)[] =
+        let pairs = ResizeArray<int * int>()
+        let row aStart aEnd bStart bEnd backwards =
+            let width = bEnd - bStart
+            let mutable previous = Array.zeroCreate<int> (width + 1)
+            let mutable current = Array.zeroCreate<int> (width + 1)
+            for ai = 0 to aEnd - aStart - 1 do
+                current.[0] <- 0
+                let av = a.[if backwards then aEnd - ai - 1 else aStart + ai]
+                for j = 1 to width do
+                    let bv = b.[if backwards then bEnd - j else bStart + j - 1]
+                    current.[j] <- if av = bv then previous.[j - 1] + 1 else max previous.[j] current.[j - 1]
+                let old = previous
+                previous <- current
+                current <- old
+            previous
+        let rec visit aStart aEnd bStart bEnd =
+            if aStart < aEnd && bStart < bEnd then
+                if aEnd - aStart = 1 then
+                    let mutable j = bStart
+                    while j < bEnd && a.[aStart] <> b.[j] do j <- j + 1
+                    if j < bEnd then pairs.Add(aStart, j)
+                else
+                    let middle = aStart + (aEnd - aStart) / 2
+                    let split =
+                        let forward = row aStart middle bStart bEnd false
+                        let backward = row middle aEnd bStart bEnd true
+                        let width = bEnd - bStart
+                        let mutable best = -1
+                        let mutable choice = 0
+                        for j = 0 to width do
+                            let score = forward.[j] + backward.[width - j]
+                            if score > best then
+                                best <- score
+                                choice <- j
+                        bStart + choice
+                    visit aStart middle bStart split
+                    visit middle aEnd split bEnd
+        visit 0 a.Length 0 b.Length
+        pairs.ToArray()
 
-    /// 3-way merge of file contents. Ok merged bytes if clean, Error () on conflict.
+    /// Only valid UTF-8 text is line-merged. Binary and malformed text must
+    /// conflict rather than be silently rewritten using replacement characters.
     let mergeText (baseB: byte[]) (oursB: byte[]) (theirsB: byte[]) : Result<byte[], unit> =
         if oursB = theirsB then Ok oursB
         elif baseB = oursB then Ok theirsB
         elif baseB = theirsB then Ok oursB
+        elif Array.exists ((=) 0uy) baseB || Array.exists ((=) 0uy) oursB || Array.exists ((=) 0uy) theirsB then Error ()
         else
-            let la = splitLines (Encoding.UTF8.GetString baseB)
-            let lo = splitLines (Encoding.UTF8.GetString oursB)
-            let lt = splitLines (Encoding.UTF8.GetString theirsB)
-            let oMap = dict (lcsPairs la lo)
-            let tMap = dict (lcsPairs la lt)
-            // base indices matched in BOTH ours and theirs are sync points
-            let syncs =
-                [ yield (-1, -1, -1)
-                  for bi in 0 .. la.Length - 1 do
-                      match oMap.TryGetValue bi, tMap.TryGetValue bi with
-                      | (true, oi), (true, ti) -> yield (bi, oi, ti)
-                      | _ -> ()
-                  yield (la.Length, lo.Length, lt.Length) ]
-            let out = ResizeArray<string>()
-            let mutable conflict = false
-            let mutable prev = List.head syncs
-            for cur in List.tail syncs do
-                let (pb, po, pt) = prev
-                let (b, o, t) = cur
-                let seg (arr: string[]) lo hi = if hi >= lo then arr.[lo..hi] else [||]
-                let baseSeg = seg la (pb + 1) (b - 1)
-                let ourSeg = seg lo (po + 1) (o - 1)
-                let theirSeg = seg lt (pt + 1) (t - 1)
-                if ourSeg = theirSeg then out.AddRange ourSeg
-                elif ourSeg = baseSeg then out.AddRange theirSeg
-                elif theirSeg = baseSeg then out.AddRange ourSeg
-                else conflict <- true
-                if b < la.Length then out.Add la.[b]   // emit the shared sync line
-                prev <- cur
-            if conflict then Error ()
-            else Ok(Encoding.UTF8.GetBytes(String.Concat(out)))
-
-    // ---- tree merge -------------------------------------------------------
-
-    [<Struct>]
-    type private Ent = { Mode: int; Hash: GitHash }
-
-    let private entriesMap (repo: Repo) (treeHash: GitHash option) : Map<string, Ent> =
-        match treeHash with
-        | None -> Map.empty
-        | Some h ->
-            match ReadObjects.readTree repo h with
-            | Ok es -> es |> Array.map (fun e -> e.Path, { Mode = e.Mode; Hash = e.Hash }) |> Map.ofArray
-            | Error _ -> Map.empty
-
-    /// Merge one tree level. Returns (mergedTreeHash, conflictPaths).
-    let rec private mergeLevel (repo: Repo) (prefix: string) (baseT: GitHash option) (ourT: GitHash option) (theirT: GitHash option) : GitHash * string list =
-        let b = entriesMap repo baseT
-        let o = entriesMap repo ourT
-        let th = entriesMap repo theirT
-        let names =
-            Set.unionMany [ Set.ofSeq (Seq.map fst (Map.toSeq b))
-                            Set.ofSeq (Seq.map fst (Map.toSeq o))
-                            Set.ofSeq (Seq.map fst (Map.toSeq th)) ]
-        let resolved = ResizeArray<TreeEntry>()
-        let mutable conflicts : string list = []
-        for name in names do
-            let bb = Map.tryFind name b
-            let oo = Map.tryFind name o
-            let tt = Map.tryFind name th
-            let full = if prefix = "" then name else prefix + "/" + name
-            let keep (e: Ent) = resolved.Add { Mode = e.Mode; Path = name; Hash = e.Hash }
-            if oo = tt then
-                match oo with Some e -> keep e | None -> ()
-            elif oo = bb then
-                match tt with Some e -> keep e | None -> ()   // ours unchanged -> take theirs (incl delete)
-            elif tt = bb then
-                match oo with Some e -> keep e | None -> ()    // theirs unchanged -> take ours
-            else
-                match oo, tt with
-                | Some oe, Some te when oe.Mode = 0o40000 && te.Mode = 0o40000 ->
-                    let bSub = bb |> Option.bind (fun e -> if e.Mode = 0o40000 then Some e.Hash else None)
-                    let subHash, subConf = mergeLevel repo full bSub (Some oe.Hash) (Some te.Hash)
-                    resolved.Add { Mode = 0o40000; Path = name; Hash = subHash }
-                    conflicts <- conflicts @ subConf
-                | Some oe, Some te when oe.Mode <> 0o40000 && te.Mode <> 0o40000 ->
-                    let blob (h: GitHash) = match ReadObjects.readBlob repo h with Ok b -> b | Error _ -> [||]
-                    let baseContent =
-                        match bb with
-                        | Some e when e.Mode <> 0o40000 -> blob e.Hash
-                        | _ -> [||]
-                    match mergeText baseContent (blob oe.Hash) (blob te.Hash) with
-                    | Ok merged ->
-                        match ObjectWriter.writeBlob repo merged with
-                        | Ok h -> resolved.Add { Mode = (if oe.Mode = te.Mode then oe.Mode else oe.Mode); Path = name; Hash = h }
-                        | Error _ -> conflicts <- conflicts @ [ full ]
-                    | Error () -> conflicts <- conflicts @ [ full ]
-                | _ -> conflicts <- conflicts @ [ full ]   // type mismatch / modify-delete
-        let treeHash = match ObjectWriter.writeTree repo (resolved.ToArray()) with Ok h -> h | Error _ -> ""
-        treeHash, conflicts
-
-    let private ancestorsSet (repo: Repo) (c: GitHash) : HashSet<GitHash> =
-        let seen = HashSet<GitHash>()
-        let q = Queue<GitHash>()
-        q.Enqueue c
-        while q.Count > 0 do
-            let x = q.Dequeue()
-            if seen.Add x then
-                match CommitHistory.getParents repo x with
-                | Ok ps -> for p in ps do if not (seen.Contains p) then q.Enqueue p
-                | _ -> ()
-        seen
-
-    /// Lowest common ancestor of two commits (correct for non-criss-cross
-    /// histories, which is the case for the forge's branch-from-default flow).
-    let private mergeBaseOf (repo: Repo) (a: GitHash) (b: GitHash) : GitHash option =
-        let anc = ancestorsSet repo a
-        let seen = HashSet<GitHash>()
-        let q = Queue<GitHash>()
-        q.Enqueue b
-        let mutable result = None
-        while q.Count > 0 && result.IsNone do
-            let x = q.Dequeue()
-            if seen.Add x then
-                if anc.Contains x then result <- Some x
-                else
-                    match CommitHistory.getParents repo x with
-                    | Ok ps -> for p in ps do q.Enqueue p
+            try
+                let la = splitLines (utf8.GetString baseB)
+                let lo = splitLines (utf8.GetString oursB)
+                let lt = splitLines (utf8.GetString theirsB)
+                let ours = dict (lineMatches la lo)
+                let theirs = dict (lineMatches la lt)
+                let output = StringBuilder()
+                let mutable conflict = false
+                let mutable pb = -1
+                let mutable po = -1
+                let mutable pt = -1
+                let apply b o t =
+                    let segment (lines: string[]) first last =
+                        if first < last then lines.[first .. last - 1] else [||]
+                    let original = segment la (pb + 1) b
+                    let left = segment lo (po + 1) o
+                    let right = segment lt (pt + 1) t
+                    if left = right then output.Append(String.Concat left) |> ignore
+                    elif left = original then output.Append(String.Concat right) |> ignore
+                    elif right = original then output.Append(String.Concat left) |> ignore
+                    else conflict <- true
+                    if b < la.Length then output.Append(la.[b]) |> ignore
+                    pb <- b
+                    po <- o
+                    pt <- t
+                for bi = 0 to la.Length - 1 do
+                    match ours.TryGetValue bi, theirs.TryGetValue bi with
+                    | (true, oi), (true, ti) -> apply bi oi ti
                     | _ -> ()
-        result
+                apply la.Length lo.Length lt.Length
+                if conflict then Error () else Ok(utf8.GetBytes(output.ToString()))
+            with :? DecoderFallbackException -> Error ()
 
-    /// 3-way merge `theirCommit` into `ourCommit`. On a clean merge, writes a
-    /// merge commit (parents [our; their]) and returns its id.
+    let private isTree mode = mode = 0o40000
+    let private isRegular mode = mode = 0o100644 || mode = 0o100755
+    let private isSymlink mode = mode = 0o120000
+    let private isGitlink mode = mode = 0o160000
+
+    let private entries (repo: Repo) (hash: GitHash option) : Result<Map<string, TreeEntry>, string> =
+        match hash with
+        | None -> Ok Map.empty
+        | Some tree -> ReadObjects.readTree repo tree |> Result.map (Array.map (fun e -> e.Path, e) >> Map.ofArray)
+
+    // Verify objects retained without rewriting. A gitlink points to a commit
+    // in another repository and must never be read as a local blob.
+    let rec private verifyEntry (repo: Repo) (entry: TreeEntry) : Result<unit, string> =
+        if isGitlink entry.Mode then Ok ()
+        elif isTree entry.Mode then
+            match ReadObjects.readTree repo entry.Hash with
+            | Error message -> Error message
+            | Ok children ->
+                children
+                |> Array.fold (fun result child -> result |> Result.bind (fun () -> verifyEntry repo child)) (Ok ())
+        elif isRegular entry.Mode || isSymlink entry.Mode then
+            ReadObjects.readBlob repo entry.Hash |> Result.map ignore
+        else Error $"Unsupported tree entry mode {entry.Mode} at {entry.Path}"
+
+    let private resolveMode (baseMode: int option) (ours: int) (theirs: int) : int option =
+        if ours = theirs then Some ours
+        elif baseMode = Some ours then Some theirs
+        elif baseMode = Some theirs then Some ours
+        else None
+
+    /// Merge recursively; write only fully resolved, verified trees. Errors are
+    /// distinct from content conflicts and are never converted to empty objects.
+    let rec private mergeLevel (repo: Repo) (prefix: string) (baseT: GitHash option) (ourT: GitHash option) (theirT: GitHash option) : Result<MergeResult, string> =
+        match entries repo baseT, entries repo ourT, entries repo theirT with
+        | Error message, _, _ | _, Error message, _ | _, _, Error message -> Error message
+        | Ok baseEntries, Ok ourEntries, Ok theirEntries ->
+            let names =
+                Set.unionMany [ baseEntries |> Map.keys |> Set.ofSeq
+                                ourEntries |> Map.keys |> Set.ofSeq
+                                theirEntries |> Map.keys |> Set.ofSeq ]
+            let merged = ResizeArray<TreeEntry>()
+            let conflicts = ResizeArray<string>()
+            let mutable failure = None
+            let keep name (entry: TreeEntry) =
+                match verifyEntry repo entry with
+                | Ok () -> merged.Add { entry with Path = name }
+                | Error message -> failure <- Some message
+            for name in names do
+                if failure.IsNone then
+                    let b = Map.tryFind name baseEntries
+                    let o = Map.tryFind name ourEntries
+                    let t = Map.tryFind name theirEntries
+                    let path = if prefix = "" then name else prefix + "/" + name
+                    if o = t then
+                        match o with Some e -> keep name e | None -> ()
+                    elif o = b then
+                        match t with Some e -> keep name e | None -> ()
+                    elif t = b then
+                        match o with Some e -> keep name e | None -> ()
+                    else
+                        match o, t with
+                        | Some oe, Some te when isTree oe.Mode && isTree te.Mode && (b.IsNone || (b |> Option.exists (fun e -> isTree e.Mode))) ->
+                            let baseHash = b |> Option.map (fun e -> e.Hash)
+                            match mergeLevel repo path baseHash (Some oe.Hash) (Some te.Hash) with
+                            | Ok (Clean hash) -> merged.Add { Mode = 0o40000; Path = name; Hash = hash }
+                            | Ok (Conflict paths) -> conflicts.AddRange paths
+                            | Error message -> failure <- Some message
+                        | Some oe, Some te when isRegular oe.Mode && isRegular te.Mode && (b.IsNone || (b |> Option.exists (fun e -> isRegular e.Mode))) ->
+                            match resolveMode (b |> Option.map (fun e -> e.Mode)) oe.Mode te.Mode with
+                            | None -> conflicts.Add path
+                            | Some mode ->
+                                let baseBlob =
+                                    match b with None -> Ok [||] | Some e -> ReadObjects.readBlob repo e.Hash
+                                match baseBlob, ReadObjects.readBlob repo oe.Hash, ReadObjects.readBlob repo te.Hash with
+                                | Error message, _, _ | _, Error message, _ | _, _, Error message -> failure <- Some message
+                                | Ok baseBytes, Ok ourBytes, Ok theirBytes ->
+                                    match mergeText baseBytes ourBytes theirBytes with
+                                    | Error () -> conflicts.Add path
+                                    | Ok bytes ->
+                                        match ObjectWriter.writeBlob repo bytes with
+                                        | Ok hash -> merged.Add { Mode = mode; Path = name; Hash = hash }
+                                        | Error message -> failure <- Some message
+                        | _ -> conflicts.Add path // symlink, gitlink, modify/delete or type divergence
+            match failure with
+            | Some message -> Error message
+            | None when conflicts.Count > 0 -> Ok (Conflict (conflicts.ToArray()))
+            | None -> ObjectWriter.writeTree repo (merged.ToArray()) |> Result.map Clean
+
+    /// Explicit-base merge, shared by both public merge APIs.
+    let mergeTree (repo: Repo) (baseTree: GitHash) (ourTree: GitHash) (theirTree: GitHash) : Result<MergeResult, string> =
+        mergeLevel repo "" (Some baseTree) (Some ourTree) (Some theirTree)
+
+    /// Merge `theirCommit` into `ourCommit` and persist the resulting merge commit.
     let merge (repo: Repo) (ourCommit: GitHash) (theirCommit: GitHash) (author: Signature) (message: string) : MergeOutcome =
-        match ReadObjects.readCommit repo ourCommit, ReadObjects.readCommit repo theirCommit with
-        | Ok ourC, Ok theirC ->
-            let baseTree =
-                match mergeBaseOf repo ourCommit theirCommit with
-                | Some bc -> (match ReadObjects.readCommit repo bc with Ok c -> Some c.Tree | _ -> None)
-                | None -> None
-            let treeHash, conflicts = mergeLevel repo "" baseTree (Some ourC.Tree) (Some theirC.Tree)
-            if not (List.isEmpty conflicts) then Conflicts conflicts
-            else
-                let commit : CommitData =
-                    { Tree = treeHash
-                      Parents = [| ourCommit; theirCommit |]
-                      Author = author
-                      Committer = author
-                      Message = message }
-                match ObjectWriter.writeCommit repo commit with
-                | Ok h -> Merged h
-                | Error e -> MergeError e
-        | _ -> MergeError "could not read merge endpoints"
+        match CommitHistory.mergeBase repo ourCommit theirCommit with
+        | Error error -> MergeError error
+        | Ok None -> MergeError "No merge base found"
+        | Ok (Some baseHash) ->
+            match ReadObjects.readCommit repo baseHash, ReadObjects.readCommit repo ourCommit, ReadObjects.readCommit repo theirCommit with
+            | Error error, _, _ | _, Error error, _ | _, _, Error error -> MergeError error
+            | Ok baseCommit, Ok ourCommitData, Ok theirCommitData ->
+                match mergeTree repo baseCommit.Tree ourCommitData.Tree theirCommitData.Tree with
+                | Error error -> MergeError error
+                | Ok (Conflict paths) -> Conflicts (List.ofArray paths)
+                | Ok (Clean treeHash) ->
+                    let commit =
+                        { Tree = treeHash
+                          Parents = [| ourCommit; theirCommit |]
+                          Author = author
+                          Committer = author
+                          Message = message }
+                    match ObjectWriter.writeCommit repo commit with
+                    | Ok hash -> Merged hash
+                    | Error error -> MergeError error

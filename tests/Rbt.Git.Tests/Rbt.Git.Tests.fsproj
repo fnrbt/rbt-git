@@ -4,6 +4,12 @@
     <TargetFramework>net10.0</TargetFramework>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="CoreRegression.fs" />
+    <Compile Include="ParsingRegression.fs" />
+    <Compile Include="StorageRegression.fs" />
+    <Compile Include="HistoryRegression.fs" />
+    <Compile Include="WorktreeRegression.fs" />
+    <Compile Include="ProtocolRegression.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
   <ItemGroup>

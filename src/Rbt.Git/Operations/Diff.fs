@@ -1,164 +1,138 @@
 namespace Rbt.Git
 
+open System
+open System.IO
+open System.Text
 open System.Collections.Generic
 
 module Diff =
-    
-    let private mapTree (repo: Repo) (tree: GitHash) : Result<Dictionary<string, GitHash>, string> =
-        TreeOperations.treeToMap repo tree
-    
-    let rec private diffTreesInternal (entries1: TreeEntry[]) (entries2: TreeEntry[]) (path: string) (repo: Repo) (changes: ResizeArray<FileChange>) : Result<ResizeArray<FileChange>, string> =
-        let map1 = entries1 |> Array.map (fun e -> e.Path, e) |> dict
-        let map2 = entries2 |> Array.map (fun e -> e.Path, e) |> dict
-        let names =
-            Array.append (entries1 |> Array.map (fun e -> e.Path)) (entries2 |> Array.map (fun e -> e.Path))
-            |> Array.distinct
-        let isTree (e: TreeEntry) = e.Mode &&& 0o40000 <> 0
-        let full (name: string) = if System.String.IsNullOrEmpty path then name else $"{path}/{name}"
-        // Recurse into a subtree present on one or both sides. Only leaf (blob)
-        // differences are emitted; directories themselves are never reported,
-        // matching `git diff`.
-        let recurseSub (h1: GitHash option) (h2: GitHash option) (name: string) =
-            let load (h: GitHash option) =
-                match h with
-                | Some hh -> (match TreeOperations.listTree repo hh with Ok es -> es | Error _ -> [||])
-                | None -> [||]
-            diffTreesInternal (load h1) (load h2) (full name) repo changes |> ignore
-        for name in names do
-            let e1 = if map1.ContainsKey name then Some map1.[name] else None
-            let e2 = if map2.ContainsKey name then Some map2.[name] else None
-            match e1, e2 with
-            | Some a, Some b when a.Hash = b.Hash && a.Mode = b.Mode -> ()
-            | Some a, Some b ->
-                match isTree a, isTree b with
-                | true, true -> recurseSub (Some a.Hash) (Some b.Hash) name
-                | false, false ->
-                    changes.Add { Path = full name; OldHash = Some a.Hash; NewHash = Some b.Hash; ChangeType = Modified }
-                | true, false ->
-                    recurseSub (Some a.Hash) None name
-                    changes.Add { Path = full name; OldHash = None; NewHash = Some b.Hash; ChangeType = Added }
-                | false, true ->
-                    changes.Add { Path = full name; OldHash = Some a.Hash; NewHash = None; ChangeType = Deleted }
-                    recurseSub None (Some b.Hash) name
-            | Some a, None ->
-                if isTree a then recurseSub (Some a.Hash) None name
-                else changes.Add { Path = full name; OldHash = Some a.Hash; NewHash = None; ChangeType = Deleted }
-            | None, Some b ->
-                if isTree b then recurseSub None (Some b.Hash) name
-                else changes.Add { Path = full name; OldHash = None; NewHash = Some b.Hash; ChangeType = Added }
-            | None, None -> ()
-        Ok changes
-    
+    let private compareEntries (oldEntries: TreeEntry[]) (newEntries: TreeEntry[]) =
+        let oldMap = oldEntries |> Array.map (fun e -> e.Path, e) |> Map.ofArray
+        let newMap = newEntries |> Array.map (fun e -> e.Path, e) |> Map.ofArray
+        Set.union (oldMap |> Map.keys |> Set.ofSeq) (newMap |> Map.keys |> Set.ofSeq)
+        |> Seq.choose (fun path ->
+            match Map.tryFind path oldMap, Map.tryFind path newMap with
+            | Some a, Some b when a.Hash = b.Hash && a.Mode = b.Mode -> None
+            | Some a, Some b -> Some { Path = path; OldHash = Some a.Hash; NewHash = Some b.Hash; OldMode = Some a.Mode; NewMode = Some b.Mode; ChangeType = ChangeType.Modified }
+            | Some a, None -> Some { Path = path; OldHash = Some a.Hash; NewHash = None; OldMode = Some a.Mode; NewMode = None; ChangeType = ChangeType.Deleted }
+            | None, Some b -> Some { Path = path; OldHash = None; NewHash = Some b.Hash; OldMode = None; NewMode = Some b.Mode; ChangeType = ChangeType.Added }
+            | _ -> None)
+        |> Seq.toArray
+
     let diffTrees (repo: Repo) (oldTree: GitHash) (newTree: GitHash) : Result<FileChange[], string> =
-        match TreeOperations.listTree repo oldTree, TreeOperations.listTree repo newTree with
-        | Ok entries1, Ok entries2 ->
-            match diffTreesInternal entries1 entries2 "" repo (ResizeArray()) with
-            | Ok changes -> Ok (changes.ToArray())
-            | Error msg -> Error msg
-        | Error msg, _ -> Error msg
-        | _, Error msg -> Error msg
-    
+        TreeOperations.listTreeEntriesRecursive repo oldTree
+        |> Result.bind (fun a -> TreeOperations.listTreeEntriesRecursive repo newTree |> Result.map (compareEntries a))
+
     let diffCommits (repo: Repo) (oldCommit: GitHash) (newCommit: GitHash) : Result<FileChange[], string> =
-        match ReadObjects.readCommit repo oldCommit, ReadObjects.readCommit repo newCommit with
-        | Ok oldData, Ok newData ->
-            diffTrees repo oldData.Tree newData.Tree
-        | Error msg, _ -> Error msg
-        | _, Error msg -> Error msg
-    
+        ReadObjects.readCommit repo oldCommit
+        |> Result.bind (fun a -> ReadObjects.readCommit repo newCommit |> Result.bind (fun b -> diffTrees repo a.Tree b.Tree))
+
     let getChangedFiles (repo: Repo) (commit: GitHash) : Result<FileChange[], string> =
-        match ReadObjects.readCommit repo commit with
-        | Ok commitData when Array.isEmpty commitData.Parents ->
-            match TreeOperations.listTree repo commitData.Tree with
-            | Ok entries ->
-                let changes = 
-                    entries
-                    |> Array.map (fun entry -> {
-                        Path = entry.Path
-                        OldHash = None
-                        NewHash = Some entry.Hash
-                        ChangeType = Added
-                    })
-                Ok changes
-            | Error msg -> Error msg
-        | Ok commitData ->
-            let parent = commitData.Parents.[0]
-            match ReadObjects.readCommit repo parent with
-            | Ok parentData ->
-                diffTrees repo parentData.Tree commitData.Tree
-            | Error msg -> Error msg
-        | Error msg -> Error msg
-    
+        ReadObjects.readCommit repo commit
+        |> Result.bind (fun data ->
+            if data.Parents.Length = 0 then
+                TreeOperations.listTreeEntriesRecursive repo data.Tree |> Result.map (compareEntries [||])
+            else
+                ReadObjects.readCommit repo data.Parents.[0] |> Result.bind (fun parent -> diffTrees repo parent.Tree data.Tree))
+
     let diffWorkingTree (repo: Repo) (tree: GitHash) : Result<FileChange[], string> =
-        if not (Repository.hasWorkTree repo) then
-            Error "Cannot diff working tree of bare repository"
+        if not (Repository.hasWorkTree repo) then Error "Cannot diff working tree of bare repository"
         else
-            match IndexParser.readIndex repo with
-            | Ok index ->
-                let workTree = repo.WorkTree.Value
-                let changes = ResizeArray()
-                
-                for entry in index.Entries do
-                    let fullPath = System.IO.Path.Combine(workTree, entry.Path.Replace('/', System.IO.Path.DirectorySeparatorChar))
-                    
-                    if not (System.IO.File.Exists fullPath) then
-                        changes.Add {
-                            Path = entry.Path
-                            OldHash = Some entry.Hash
-                            NewHash = None
-                            ChangeType = Deleted
-                        }
-                    else
-                        let content = System.IO.File.ReadAllBytes fullPath
-                        let hash = Hashing.hashBlob content
-                        
-                        if hash <> entry.Hash then
-                            changes.Add {
-                                Path = entry.Path
-                                OldHash = Some entry.Hash
-                                NewHash = Some hash
-                                ChangeType = Modified
-                            }
-                
-                match TreeOperations.treeToMap repo tree with
-                | Ok treeMap ->
-                    for entry in index.Entries do
-                        if treeMap.ContainsKey entry.Path then
-                            treeMap.Remove entry.Path |> ignore
-                    
-                    for path in treeMap.Keys do
-                        changes.Add {
-                            Path = path
-                            OldHash = Some treeMap.[path]
-                            NewHash = None
-                            ChangeType = Deleted
-                        }
-                    Ok (changes.ToArray())
-                | Error msg -> Error msg
-            | Error msg -> Error msg
-    
+            try
+                let honorFileMode = TreeOperations.honorsFileMode repo |> Result.defaultWith (fun e -> raise (InvalidDataException e))
+                IndexParser.readIndex repo |> Result.bind (fun index ->
+                    TreeOperations.listTreeEntriesRecursive repo tree |> Result.bind (fun oldEntries ->
+                        let entries = ResizeArray<TreeEntry>()
+                        let mutable error = None
+                        for entry in index.Entries do
+                            if entry.Stage <> 0 then error <- Some $"Unmerged index entry: {entry.Path}"
+                            else
+                                match TreeOperations.safeWorkTreePath repo entry.Path with
+                                | Error msg -> error <- Some msg
+                                | Ok path ->
+                                    if entry.Mode &&& 0o170000 = 0o160000 then
+                                        if Directory.Exists path then entries.Add { Path = entry.Path; Hash = entry.Hash; Mode = entry.Mode }
+                                    else
+                                        let info = FileInfo path
+                                        if not (isNull info.LinkTarget) then
+                                            let hash = Hashing.hashBlob (Encoding.UTF8.GetBytes info.LinkTarget)
+                                            entries.Add { Path = entry.Path; Hash = hash; Mode = 0o120000 }
+                                        elif File.Exists path then
+                                            let mode =
+                                                if OperatingSystem.IsWindows() || not honorFileMode then entry.Mode
+                                                elif File.GetUnixFileMode(path) &&& UnixFileMode.UserExecute <> enum<UnixFileMode>(0) then 0o100755
+                                                else 0o100644
+                                            entries.Add { Path = entry.Path; Hash = Hashing.hashBlob (File.ReadAllBytes path); Mode = mode }
+                        match error with
+                        | Some msg -> Error msg
+                        | None -> Ok (compareEntries oldEntries (entries.ToArray()))))
+            with ex -> Error $"Failed to diff worktree: {ex.Message}"
+
     let getPatch (repo: Repo) (change: FileChange) : Result<string, string> =
-        let getBlobContent (hashOpt: GitHash option) : Result<byte[] option, string> =
-            match hashOpt with
-            | Some hash ->
+        let load isNew hash mode =
+            match hash, mode with
+            | None, None -> Ok [||]
+            | Some hash, Some mode when mode &&& 0o170000 = 0o160000 ->
+                Ok (Encoding.UTF8.GetBytes($"Subproject commit {hash}\n"))
+            | Some hash, Some _ ->
                 match ReadObjects.readBlob repo hash with
-                | Ok data -> Ok (Some data)
-                | Error msg -> Error msg
-            | None -> Ok None
-        
-        match getBlobContent change.OldHash, getBlobContent change.NewHash with
-        | Ok oldData, Ok newData ->
-            let oldText = 
-                match oldData with
-                | Some d -> System.Text.Encoding.UTF8.GetString d
-                | None -> ""
-            
-            let newText = 
-                match newData with
-                | Some d -> System.Text.Encoding.UTF8.GetString d
-                | None -> ""
-            
-            let patch = $"--- a/{change.Path}\n+++ b/{change.Path}\n"
-            
-            Ok patch
-        | Error msg, _ -> Error msg
-        | _, Error msg -> Error msg
+                | Ok bytes -> Ok bytes
+                | Error message when isNew && repo.WorkTree.IsSome ->
+                    try
+                        let path = TreeOperations.safeWorkTreePath repo change.Path |> Result.defaultWith (fun e -> raise (InvalidDataException e))
+                        let link = (FileInfo path).LinkTarget
+                        let bytes = if isNull link then File.ReadAllBytes path else Encoding.UTF8.GetBytes link
+                        if Hashing.hashBlob bytes = hash then Ok bytes else Error message
+                    with _ -> Error message
+                | Error message -> Error message
+            | _ -> Error "Inconsistent patch hash and mode"
+        let validUtf8 (bytes: byte[]) =
+            try
+                UTF8Encoding(false, true).GetCharCount bytes |> ignore
+                true
+            with :? DecoderFallbackException -> false
+        load false change.OldHash change.OldMode |> Result.bind (fun oldBytes ->
+            load true change.NewHash change.NewMode |> Result.bind (fun newBytes ->
+                if Array.contains 0uy oldBytes || Array.contains 0uy newBytes then Error "Cannot generate a textual patch for binary data"
+                elif not (validUtf8 oldBytes && validUtf8 newBytes) then Error "Cannot generate a textual patch for non-UTF-8 data"
+                elif change.Path.Contains('\n') || change.Path.Contains('\r') || change.Path.Contains('\t') then Error "Cannot generate a patch for this path"
+                else
+                    let split (bytes: byte[]) =
+                        if bytes.Length = 0 then [||], true
+                        else
+                            let text = Encoding.UTF8.GetString bytes
+                            let ends = text.EndsWith("\n", StringComparison.Ordinal)
+                            let lines = text.Split('\n')
+                            (if ends then lines.[0 .. lines.Length - 2] else lines), ends
+                    let oldLines, oldEnds = split oldBytes
+                    let newLines, newEnds = split newBytes
+                    let oldName = if change.OldHash.IsNone then "/dev/null" else "a/" + change.Path
+                    let newName = if change.NewHash.IsNone then "/dev/null" else "b/" + change.Path
+                    let output = StringBuilder()
+                    output.Append($"diff --git a/{change.Path} b/{change.Path}\n") |> ignore
+                    match change.OldMode, change.NewMode with
+                    | None, Some mode -> output.Append(sprintf "new file mode %06o\n" mode) |> ignore
+                    | Some mode, None -> output.Append(sprintf "deleted file mode %06o\n" mode) |> ignore
+                    | Some oldMode, Some newMode when oldMode <> newMode ->
+                        output.Append(sprintf "old mode %06o\nnew mode %06o\n" oldMode newMode) |> ignore
+                    | _ -> ()
+                    if change.OldHash <> change.NewHash then
+                        let oldHash = defaultArg change.OldHash (String('0', 40))
+                        let newHash = defaultArg change.NewHash (String('0', 40))
+                        let modeSuffix =
+                            match change.OldMode, change.NewMode with
+                            | Some a, Some b when a = b -> sprintf " %06o" a
+                            | _ -> ""
+                        output.Append($"index {oldHash}..{newHash}{modeSuffix}\n") |> ignore
+                    if oldBytes <> newBytes then
+                        output.Append($"--- {oldName}\n+++ {newName}\n") |> ignore
+                        let oldStart = if oldLines.Length = 0 then 0 else 1
+                        let newStart = if newLines.Length = 0 then 0 else 1
+                        output.Append($"@@ -{oldStart},{oldLines.Length} +{newStart},{newLines.Length} @@\n") |> ignore
+                        for i = 0 to oldLines.Length - 1 do
+                            output.Append('-').Append(oldLines.[i]).Append('\n') |> ignore
+                            if i = oldLines.Length - 1 && not oldEnds then output.Append("\\ No newline at end of file\n") |> ignore
+                        for i = 0 to newLines.Length - 1 do
+                            output.Append('+').Append(newLines.[i]).Append('\n') |> ignore
+                            if i = newLines.Length - 1 && not newEnds then output.Append("\\ No newline at end of file\n") |> ignore
+                    Ok (output.ToString())))

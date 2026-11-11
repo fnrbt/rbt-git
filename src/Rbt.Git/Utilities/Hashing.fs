@@ -1,6 +1,7 @@
 namespace Rbt.Git
 
 open System
+open System.IO
 open System.Security.Cryptography
 open System.Text
 
@@ -27,34 +28,76 @@ module Hashing =
         else
             Error $"Invalid git hash format: {str}"
     
-    let hashBlob (data: byte[]) : GitHash =
-        let headerText = $"blob {data.Length}\0"
-        let header = Encoding.UTF8.GetBytes headerText
-        let combined = Array.concat [| header; data |]
-        sha1 combined
-    
-    let hashTree (entries: TreeEntry[]) : GitHash =
-        let sb = Text.StringBuilder()
-        for entry in entries do
-            sb.AppendFormat(" {0:o} {1}\0", entry.Mode, entry.Path) |> ignore
-        let headerPart = Encoding.UTF8.GetBytes (sb.ToString())
-        let hashParts = entries |> Array.collect (fun entry -> Seq.toArray (entry.Hash |> Seq.map (fun c -> byte c)))
-        let combined = Array.concat [| headerPart; hashParts |]
-        sha1 combined
-    
-    let hashCommit (commit: CommitData) : GitHash =
-        let sb = Text.StringBuilder()
-        sb.AppendLine $"tree {commit.Tree}" |> ignore
+    let hashRaw (objType: string) (content: byte[]) : GitHash =
+        let header = Encoding.UTF8.GetBytes(sprintf "%s %d\000" objType content.Length)
+        use hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA1)
+        hasher.AppendData(header)
+        hasher.AppendData(content)
+        Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant()
+
+    let hashBlob (data: byte[]) : GitHash = hashRaw "blob" data
+
+    let private signatureLine (label: string) (signature: Signature) =
+        let minutes = int signature.Time.Offset.TotalMinutes
+        let sign = if minutes < 0 then "-" else "+"
+        sprintf "%s %s <%s> %d %s%02d%02d\n"
+            label signature.Name signature.Email (signature.Time.ToUnixTimeSeconds())
+            sign (abs minutes / 60) (abs minutes % 60)
+
+    let private hashBytes (hash: GitHash) =
+        if hash.Length <> 40 then invalidArg "hash" "Expected a 40-character object ID"
+        let bytes = Array.zeroCreate<byte> 20
+        for i in 0 .. 19 do
+            bytes.[i] <- Convert.ToByte(hash.Substring(i * 2, 2), 16)
+        bytes
+
+    /// Git compares tree names bytewise, treating a directory as ending in '/'.
+    let serializeTree (entries: TreeEntry[]) : byte[] =
+        let keyed =
+            entries |> Array.map (fun entry ->
+                let name = Encoding.UTF8.GetBytes entry.Path
+                let key = if entry.Mode = 0o40000 then Array.append name [| byte '/' |] else name
+                entry, key)
+        let compare (_, x: byte[]) (_, y: byte[]) =
+            let shared = min x.Length y.Length
+            let mutable index = 0
+            while index < shared && x.[index] = y.[index] do
+                index <- index + 1
+            if index = shared then Operators.compare x.Length y.Length
+            else Operators.compare x.[index] y.[index]
+        Array.sortInPlaceWith compare keyed
+        use output = new MemoryStream()
+        for entry, _ in keyed do
+            let prefix = Encoding.UTF8.GetBytes(sprintf "%s %s\000" (Convert.ToString(entry.Mode, 8)) entry.Path)
+            output.Write prefix
+            output.Write(hashBytes entry.Hash)
+        output.ToArray()
+
+    let serializeCommit (commit: CommitData) : byte[] =
+        let text = StringBuilder()
+        text.Append("tree ").Append(commit.Tree).Append('\n') |> ignore
         for parent in commit.Parents do
-            sb.AppendLine $"parent {parent}" |> ignore
-        let authorOffset = (int commit.Author.Time.Offset.TotalMinutes).ToString("+0000;-0000")
-        let committerOffset = (int commit.Committer.Time.Offset.TotalMinutes).ToString("+0000;-0000")
-        sb.AppendLine $"author {commit.Author.Name} <{commit.Author.Email}> {commit.Author.Time.ToUnixTimeSeconds()} {authorOffset}" |> ignore
-        sb.AppendLine $"committer {commit.Committer.Name} <{commit.Committer.Email}> {commit.Committer.Time.ToUnixTimeSeconds()} {committerOffset}" |> ignore
-        sb.AppendLine() |> ignore
-        sb.Append commit.Message |> ignore
-        let commitStr = sb.ToString()
-        let headerText = $"commit {commitStr.Length}\0"
-        let header = Encoding.UTF8.GetBytes headerText
-        let combined = Array.concat [| header; Encoding.UTF8.GetBytes commitStr |]
-        sha1 combined
+            text.Append("parent ").Append(parent).Append('\n') |> ignore
+        text.Append(signatureLine "author" commit.Author) |> ignore
+        text.Append(signatureLine "committer" commit.Committer) |> ignore
+        text.Append('\n').Append(commit.Message) |> ignore
+        Encoding.UTF8.GetBytes(text.ToString())
+
+    let serializeTag (tag: TagData) : byte[] =
+        let text = StringBuilder()
+        text.Append("object ").Append(tag.Object).Append('\n') |> ignore
+        text.Append("type ").Append(tag.ObjectType).Append('\n') |> ignore
+        text.Append("tag ").Append(tag.Tag).Append('\n') |> ignore
+        text.Append(signatureLine "tagger" tag.Tagger) |> ignore
+        text.Append('\n').Append(tag.Message) |> ignore
+        Encoding.UTF8.GetBytes(text.ToString())
+
+    let serialize (obj: GitObject) : string * byte[] =
+        match obj with
+        | Blob data -> "blob", data
+        | Tree entries -> "tree", serializeTree entries
+        | Commit commit -> "commit", serializeCommit commit
+        | Tag tag -> "tag", serializeTag tag
+
+    let hashTree (entries: TreeEntry[]) : GitHash = hashRaw "tree" (serializeTree entries)
+    let hashCommit (commit: CommitData) : GitHash = hashRaw "commit" (serializeCommit commit)

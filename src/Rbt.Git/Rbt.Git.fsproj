@@ -13,8 +13,8 @@
     <Compile Include="Core\GitConfig.fs" />
     <Compile Include="Core\References.fs" />
     <Compile Include="Parsing\ObjectParser.fs" />
-    <Compile Include="Parsing\PackParser.fs" />
     <Compile Include="Parsing\PackData.fs" />
+    <Compile Include="Parsing\PackParser.fs" />
     <Compile Include="Operations\PackStore.fs" />
     <Compile Include="Parsing\IndexParser.fs" />
     <Compile Include="Operations\ObjectWriter.fs" />

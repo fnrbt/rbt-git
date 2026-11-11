@@ -112,6 +112,8 @@ type FileChange = {
     Path: string
     OldHash: GitHash option
     NewHash: GitHash option
+    OldMode: int option
+    NewMode: int option
     ChangeType: ChangeType
 }
 

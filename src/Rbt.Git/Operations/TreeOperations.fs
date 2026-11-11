@@ -4,6 +4,67 @@ open System
 open System.IO
 
 module TreeOperations =
+    /// Read effective core settings from system, user and repository config.
+    let coreSetting (repo: Repo) (key: string) : Result<string option, string> =
+        try
+            let env (name: string) = Environment.GetEnvironmentVariable name
+            let home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+            let xdg =
+                match env "XDG_CONFIG_HOME" with
+                | null | "" -> Path.Combine(home, ".config")
+                | path -> path
+            let paths = ResizeArray<string>()
+            if String.IsNullOrEmpty(env "GIT_CONFIG_NOSYSTEM") then
+                match env "GIT_CONFIG_SYSTEM" with
+                | null | "" -> paths.Add "/etc/gitconfig"
+                | path -> paths.Add path
+            match env "GIT_CONFIG_GLOBAL" with
+            | null | "" ->
+                paths.Add(Path.Combine(xdg, "git", "config"))
+                paths.Add(Path.Combine(home, ".gitconfig"))
+            | path -> paths.Add path
+            paths.Add(Repository.getConfigFile repo)
+            let mutable result = None
+            for path in paths do
+                if File.Exists path then
+                    let config = GitConfig.parseConfig (File.ReadAllText path)
+                    match GitConfig.getValue config "core" None key with
+                    | Some value -> result <- Some value
+                    | None -> ()
+            Ok result
+        with ex -> Error $"Failed to read core.{key}: {ex.Message}"
+
+    let honorsFileMode (repo: Repo) : Result<bool, string> =
+        coreSetting repo "filemode"
+        |> Result.bind (function
+            | None -> Ok true
+            | Some setting ->
+                match setting.Trim().ToLowerInvariant() with
+                | "true" | "yes" | "on" | "1" -> Ok true
+                | "false" | "no" | "off" | "0" -> Ok false
+                | other -> Error $"Invalid core.filemode value: {other}")
+
+    /// Validate a Git path before accessing the worktree. Never follow a
+    /// symlink in an ancestor, even if the target would remain inside it.
+    let safeWorkTreePath (repo: Repo) (path: string) : Result<string, string> =
+        try
+            let parts = path.Split('/')
+            if repo.WorkTree.IsNone || String.IsNullOrEmpty path || Path.IsPathRooted path
+               || path.Contains('\\') || (parts |> Array.exists (fun p ->
+                   p = "" || p = "." || p = ".." || p.Equals(".git", StringComparison.OrdinalIgnoreCase)
+                   || p.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || p.Contains(':'))) then
+                Error $"Unsafe worktree path: {path}"
+            else
+                let mutable current = repo.WorkTree.Value
+                let mutable unsafeParent = false
+                for i = 0 to parts.Length - 2 do
+                    current <- Path.Combine(current, parts.[i])
+                    let info = FileInfo current
+                    if not (isNull info.LinkTarget) then unsafeParent <- true
+                if unsafeParent then Error $"Symlink in worktree path: {path}"
+                else Ok (Path.Combine(repo.WorkTree.Value, path.Replace('/', Path.DirectorySeparatorChar)))
+        with ex -> Error $"Invalid worktree path {path}: {ex.Message}"
+
     
     let rec private resolvePathInternal (repo: Repo) (tree: GitHash) (pathParts: string[]) (index: int) : Result<GitObject * string, string> =
         if index >= pathParts.Length then
@@ -26,7 +87,7 @@ module TreeOperations =
     
     let resolvePath (repo: Repo) (tree: GitHash) (path: string) : Result<GitObject * string, string> =
         let normalizedPath = path.Replace('\\', '/').TrimStart('/')
-        if String.IsNullOrWhiteSpace normalizedPath then
+        if String.IsNullOrWhiteSpace normalizedPath || normalizedPath = "." then
             ReadObjects.readObject repo tree |> Result.map (fun obj -> (obj, tree))
         else
             let parts = normalizedPath.Split('/')
@@ -35,24 +96,30 @@ module TreeOperations =
     let listTree (repo: Repo) (tree: GitHash) : Result<TreeEntry[], string> =
         ReadObjects.readTree repo tree
     
-    let rec private listTreeRecursiveInternal (repo: Repo) (tree: GitHash) (prefix: string) (acc: ResizeArray<string * GitHash>) : Result<ResizeArray<string * GitHash>, string> =
+    let rec private collectEntries (repo: Repo) (tree: GitHash) (prefix: string) (acc: ResizeArray<TreeEntry>) : Result<unit, string> =
         match ReadObjects.readTree repo tree with
+        | Error msg -> Error msg
         | Ok entries ->
-            for entry in entries do
-                let fullPath = if String.IsNullOrEmpty prefix then entry.Path else $"{prefix}/{entry.Path}"
-                acc.Add ((fullPath, entry.Hash))
-                
-                if entry.Mode &&& 0o40000 <> 0 then
-                    match listTreeRecursiveInternal repo entry.Hash fullPath acc with
-                    | Ok _ -> ()
-                    | Error msg -> Error msg |> ignore
-            Ok acc
-        | Error msg -> Error msg
-    
+            let rec loop i =
+                if i = entries.Length then Ok ()
+                else
+                    let entry = entries.[i]
+                    let fullPath = if String.IsNullOrEmpty prefix then entry.Path else $"{prefix}/{entry.Path}"
+                    let result =
+                        if entry.Mode &&& 0o170000 = 0o040000 then
+                            collectEntries repo entry.Hash fullPath acc
+                        else
+                            acc.Add { entry with Path = fullPath }
+                            Ok ()
+                    result |> Result.bind (fun () -> loop (i + 1))
+            loop 0
+
+    let listTreeEntriesRecursive (repo: Repo) (tree: GitHash) : Result<TreeEntry[], string> =
+        let entries = ResizeArray()
+        collectEntries repo tree "" entries |> Result.map (fun () -> entries.ToArray())
+
     let listTreeRecursive (repo: Repo) (tree: GitHash) : Result<(string * GitHash)[], string> =
-        match listTreeRecursiveInternal repo tree "" (ResizeArray()) with
-        | Ok acc -> Ok (acc.ToArray())
-        | Error msg -> Error msg
+        listTreeEntriesRecursive repo tree |> Result.map (Array.map (fun e -> e.Path, e.Hash))
     
     let getTreeAtCommit (repo: Repo) (commit: GitHash) : Result<TreeEntry[], string> =
         match ReadObjects.readCommit repo commit with
@@ -99,31 +166,18 @@ module TreeOperations =
     let getSubtreeHash (repo: Repo) (tree: GitHash) (path: string) : Result<GitHash, string> =
         match resolvePath repo tree path with
         | Ok (Tree _, hash) -> Ok hash
-        | Ok (Blob _, _) -> Error $"Path is a file, not a tree: {path}"
+        | Ok _ -> Error $"Path is not a tree: {path}"
         | Error msg -> Error msg
     
     let getBlobHash (repo: Repo) (tree: GitHash) (path: string) : Result<GitHash, string> =
         match resolvePath repo tree path with
         | Ok (Blob _, hash) -> Ok hash
-        | Ok (Tree _, _) -> Error $"Path is a tree, not a blob: {path}"
-        | Error msg -> Error msg
-    
-    let rec private treeToMapInternal (repo: Repo) (tree: GitHash) (prefix: string) (map: System.Collections.Generic.Dictionary<string, GitHash>) : Result<unit, string> =
-        match ReadObjects.readTree repo tree with
-        | Ok entries ->
-            for entry in entries do
-                let fullPath = if String.IsNullOrEmpty prefix then entry.Path else $"{prefix}/{entry.Path}"
-                map.[fullPath] <- entry.Hash
-                
-                if entry.Mode &&& 0o40000 <> 0 then
-                    match treeToMapInternal repo entry.Hash fullPath map with
-                    | Ok _ -> ()
-                    | Error msg -> Error msg |> ignore
-            Ok ()
+        | Ok _ -> Error $"Path is not a blob: {path}"
         | Error msg -> Error msg
     
     let treeToMap (repo: Repo) (tree: GitHash) : Result<System.Collections.Generic.Dictionary<string, GitHash>, string> =
-        let map = System.Collections.Generic.Dictionary()
-        match treeToMapInternal repo tree "" map with
-        | Ok () -> Ok map
-        | Error msg -> Error msg
+        listTreeRecursive repo tree
+        |> Result.map (fun entries ->
+            let map = System.Collections.Generic.Dictionary<string, GitHash>(StringComparer.Ordinal)
+            for path, hash in entries do map.Add(path, hash)
+            map)

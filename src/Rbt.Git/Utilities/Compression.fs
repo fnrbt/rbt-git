@@ -13,11 +13,30 @@ module Compression =
 
 
     let decompress (compressed: byte[]) : byte[] =
+        if compressed.Length < 6 then failwith "Truncated zlib member"
+        let cmf, flags = int compressed.[0], int compressed.[1]
+        if cmf &&& 0x0f <> 8 || cmf >>> 4 > 7 ||
+           (cmf * 256 + flags) % 31 <> 0 || flags &&& 0x20 <> 0 then
+            failwith "Unsupported zlib header"
         use ms = new MemoryStream(compressed)
         use zlib = new ZLibStream(ms, CompressionMode.Decompress)
         use output = new MemoryStream()
         zlib.CopyTo(output)
-        output.ToArray()
+        let data = output.ToArray()
+        let mutable a = 1u
+        let mutable b = 0u
+        for value in data do
+            a <- (a + uint32 value) % 65521u
+            b <- (b + a) % 65521u
+        let expected = (b <<< 16) ||| a
+        let last = compressed.Length - 4
+        let trailer =
+            (uint32 compressed.[last] <<< 24) |||
+            (uint32 compressed.[last + 1] <<< 16) |||
+            (uint32 compressed.[last + 2] <<< 8) |||
+            uint32 compressed.[last + 3]
+        if expected <> trailer then failwith "Invalid zlib checksum or truncated member"
+        data
 
     let compress (data: byte[]) : byte[] =
         // ZLibStream emits no bytes when it is disposed without a non-empty

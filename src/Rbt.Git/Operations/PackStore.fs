@@ -21,7 +21,7 @@ module PackStore =
             let map = Dictionary<GitHash, int64>()
             match PackParser.readPackIndex idxPath with
             | Ok idx -> for o in idx.Objects do map.[o.Hash] <- o.Offset
-            | Error _ -> ()
+            | Error error -> failwithf "cannot read pack index %s: %s" idxPath error
             map)
 
 
@@ -91,6 +91,7 @@ module PackStore =
             |> Array.choose id
         let locations = Dictionary<GitHash, struct (SessionPack * int64)>()
         let reconstructed = Dictionary<struct (string * int64), string * byte[]>()
+        let active = HashSet<struct (string * int64)>()
         let cacheOrder = Queue<struct (string * int64)>()
         let mutable cacheBytes = 0
 
@@ -118,14 +119,19 @@ module PackStore =
             match reconstructed.TryGetValue key with
             | true, value -> Some value
             | _ ->
-                let value =
-                    PackData.readObjectAtStream
-                        pack.Stream
-                        offset
-                        (tryReadAt pack)
-                        tryReadHash
-                cacheValue key value
-                Some value
+                if active.Count >= 1024 then failwith "delta chain exceeds supported depth"
+                if not (active.Add key) then failwithf "delta cycle at %s:%d" pack.Path offset
+                try
+                    let value =
+                        PackData.readObjectAtStream
+                            pack.Stream
+                            offset
+                            (tryReadAt pack)
+                            tryReadHash
+                    cacheValue key value
+                    Some value
+                finally
+                    active.Remove key |> ignore
 
         and tryReadHash hash =
             match locations.TryGetValue hash with
@@ -214,39 +220,9 @@ module PackStore =
                 for pack in packs do pack.Stream.Dispose()
 
     /// Read an object by hash from any packfile in the repo. None if not packed.
-    let rec tryRead (repo: Repo) (hash: GitHash) : (string * byte[]) option =
-        let packs = Repository.packFilesExist repo
-        let mutable result = None
-        let mutable i = 0
-        while result.IsNone && i < packs.Length do
-            let (name, packPath) = packs.[i]
-            let idxPath = Repository.getPackIndexPath repo name
-            let map = loadIndex packPath idxPath
-            match map.TryGetValue hash with
-            | true, off ->
-                use pack =
-                    new FileStream(
-                        packPath,
-                        FileMode.Open,
-                        FileAccess.Read,
-                        FileShare.Read,
-                        64 * 1024,
-                        FileOptions.RandomAccess)
-                // Resolve bases: ofs-delta by offset within THIS pack; ref-delta by
-                // hash within this pack, else loose / other packs (thin packs).
-                let rec byOff (o: int64) : (string * byte[]) option =
-                    Some(PackData.readObjectAtStream pack o byOff byHash)
-                and byHash (h: GitHash) : (string * byte[]) option =
-                    match map.TryGetValue h with
-                    | true, o2 -> byOff o2
-                    | _ ->
-                        match tryLoose repo h with
-                        | Some r -> Some r
-                        | None -> tryRead repo h
-                result <- Some(PackData.readObjectAtStream pack off byOff byHash)
-            | _ -> ()
-            i <- i + 1
-        result
+    let tryRead (repo: Repo) (hash: GitHash) : (string * byte[]) option =
+        use session = new ReadSession(repo)
+        session.TryRead hash
 
     let exists (repo: Repo) (hash: GitHash) : bool =
         (tryRead repo hash).IsSome

@@ -6,38 +6,30 @@ open System.IO
 module Repository =
     
     let locateRepo (path: string) : Repo =
-        let rec findGitDir current =
-            let gitPath = Path.Combine(current, ".git")
-            if Directory.Exists gitPath then
-                let gitFile = Path.Combine(current, ".git")
-                if File.Exists gitFile then
-                    let content = File.ReadAllText gitFile
-                    if content.StartsWith "gitdir:" then
-                        let gitDir = content.[8..].Trim()
-                        Path.Combine(current, gitDir)
-                    else
-                        gitPath
-                else
-                    gitPath
+        let fullPath = Path.GetFullPath path
+        let start = if Directory.Exists fullPath then fullPath else Path.GetDirectoryName fullPath
+        let rec find current =
+            let dotGit = Path.Combine(current, ".git")
+            if Directory.Exists dotGit then
+                { Path = current; GitDir = Path.GetFullPath dotGit; WorkTree = Some current }
+            elif File.Exists dotGit then
+                let content = File.ReadAllText(dotGit).Trim()
+                if not (content.StartsWith("gitdir:", StringComparison.OrdinalIgnoreCase)) then
+                    raise (InvalidDataException $"Invalid gitdir file: {dotGit}")
+                let target = content.Substring(7).Trim()
+                if String.IsNullOrWhiteSpace target then
+                    raise (InvalidDataException $"Invalid gitdir file: {dotGit}")
+                let gitDir = Path.GetFullPath(target, current)
+                if not (Directory.Exists gitDir) then
+                    raise (DirectoryNotFoundException $"Git directory not found: {gitDir}")
+                { Path = current; GitDir = gitDir; WorkTree = Some current }
+            elif File.Exists(Path.Combine(current, "HEAD")) && Directory.Exists(Path.Combine(current, "objects")) then
+                { Path = current; GitDir = current; WorkTree = None }
             else
                 let parent = Directory.GetParent current
-                if isNull parent then
-                    raise (DirectoryNotFoundException $"Not a git repository: {path}")
-                else
-                    findGitDir parent.FullName
-        
-        let fullPath = Path.GetFullPath path
-        let isDir = Directory.Exists fullPath
-        let root = if isDir then fullPath else Path.GetDirectoryName fullPath
-        
-        let gitDir = findGitDir root
-        let workTree = 
-            if Directory.Exists root then
-                Some root
-            else
-                None
-        
-        { Path = root; GitDir = gitDir; WorkTree = workTree }
+                if isNull parent then raise (DirectoryNotFoundException $"Not a git repository: {path}")
+                find parent.FullName
+        find start
     
     let openRepo (path: string) : Result<Repo, string> =
         try
@@ -48,6 +40,18 @@ module Repository =
     
     let gitPath (repo: Repo) (segments: string[]) : string =
         Path.Combine(Array.append [| repo.GitDir |] segments)
+
+    /// Linked worktrees keep shared objects, refs and configuration in commondir.
+    let getCommonDir (repo: Repo) =
+        let file = Path.Combine(repo.GitDir, "commondir")
+        if File.Exists file then
+            let value = File.ReadAllText(file).Trim()
+            if String.IsNullOrWhiteSpace value then raise (InvalidDataException $"Invalid commondir: {file}")
+            Path.GetFullPath(value, repo.GitDir)
+        else repo.GitDir
+
+    let private commonPath (repo: Repo) (segments: string[]) =
+        Path.Combine(Array.append [| getCommonDir repo |] segments)
 
     let hasWorkTree (repo: Repo) : bool =
         Option.isSome repo.WorkTree
@@ -65,16 +69,16 @@ module Repository =
         gitPath repo [| "HEAD" |]
     
     let getConfigFile (repo: Repo) : string =
-        gitPath repo [| "config" |]
+        commonPath repo [| "config" |]
     
     let getIndexPath (repo: Repo) : string =
         gitPath repo [| "index" |]
     
     let getObjectsDir (repo: Repo) : string =
-        gitPath repo [| "objects" |]
+        commonPath repo [| "objects" |]
     
     let getRefsDir (repo: Repo) : string =
-        gitPath repo [| "refs" |]
+        commonPath repo [| "refs" |]
     
     let getHeadsDir (repo: Repo) : string =
         Path.Combine(getRefsDir repo, "heads")
@@ -86,7 +90,7 @@ module Repository =
         Path.Combine(getRefsDir repo, "remotes")
     
     let getPackedRefsFile (repo: Repo) : string =
-        gitPath repo [| "packed-refs" |]
+        commonPath repo [| "packed-refs" |]
     
     let getPackDir (repo: Repo) : string =
         Path.Combine(getObjectsDir repo, "pack")
@@ -135,10 +139,11 @@ module Repository =
             let refName = "refs/heads/" + defaultBranch
             let validBranch =
                 not (String.IsNullOrWhiteSpace defaultBranch)
-                && not (defaultBranch.StartsWith("/", StringComparison.Ordinal))
-                && not (defaultBranch.EndsWith("/", StringComparison.Ordinal))
+                && not (defaultBranch.EndsWith(".", StringComparison.Ordinal))
                 && not (defaultBranch.Contains("..", StringComparison.Ordinal))
-                && not (defaultBranch.Contains('\\'))
+                && not (defaultBranch.Contains("@{", StringComparison.Ordinal))
+                && (defaultBranch.Split('/') |> Array.forall (fun p -> p <> "" && not (p.StartsWith(".")) && not (p.EndsWith(".lock", StringComparison.OrdinalIgnoreCase))))
+                && not (defaultBranch |> Seq.exists (fun c -> Char.IsControl c || Char.IsWhiteSpace c || "\\~^:?*[".Contains(c)))
             if not validBranch then
                 Error $"Invalid default branch: {defaultBranch}"
             else
@@ -147,10 +152,14 @@ module Repository =
                 Directory.CreateDirectory (Path.Combine(full, "objects", "pack")) |> ignore
                 Directory.CreateDirectory (Path.Combine(full, "refs", "heads")) |> ignore
                 Directory.CreateDirectory (Path.Combine(full, "refs", "tags")) |> ignore
-                File.WriteAllText(Path.Combine(full, "HEAD"), $"ref: {refName}\n")
-                File.WriteAllText(
-                    Path.Combine(full, "config"),
-                    "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n")
+                let createIfMissing (file: string) (content: string) =
+                    try
+                        use stream = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.None)
+                        use writer = new StreamWriter(stream)
+                        writer.Write(content)
+                    with :? IOException when File.Exists file -> ()
+                createIfMissing (Path.Combine(full, "HEAD")) $"ref: {refName}\n"
+                createIfMissing (Path.Combine(full, "config")) "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n"
                 Ok { Path = full; GitDir = full; WorkTree = None }
         with ex -> Error $"Failed to init bare repository at {Path.GetFullPath path}: {ex.Message}"
 

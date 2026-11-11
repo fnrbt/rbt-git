@@ -45,6 +45,7 @@ module Fsck =
     let private verifyReachableCore (repo: Repo) (snapshot: RefSnapshot) =
         let issues = ResizeArray<FsckIssue>()
         let visited = HashSet<GitHash>(StringComparer.Ordinal)
+        let objectTypes = Dictionary<GitHash, string>(StringComparer.Ordinal)
         let pending = Stack<GitHash * string option>()
         for KeyValue(_, hash) in snapshot.Refs do pending.Push(hash, None)
         match snapshot.Head with
@@ -53,11 +54,18 @@ module Fsck =
 
         while pending.Count > 0 do
             let hash, expectedType = pending.Pop()
-            if visited.Add hash then
+            match objectTypes.TryGetValue hash with
+            | true, objectType ->
+                match expectedType with
+                | Some expected when expected <> objectType ->
+                    issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None $"expected {expected}, found {objectType}")
+                | _ -> ()
+            | _ when visited.Add hash ->
                 match ReadObjects.readRawObject repo hash with
                 | Error error ->
                     issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
                 | Ok (objectType, content) ->
+                    objectTypes.[hash] <- objectType
                     match expectedType with
                     | Some expected when expected <> objectType ->
                         issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None $"expected {expected}, found {objectType}")
@@ -69,6 +77,7 @@ module Fsck =
                     | Error error -> issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
                     | Ok objectValue ->
                         for child in objectChildren objectValue do pending.Push child
+            | _ -> ()
         visited, issues
 
     let verifyReachable (repo: Repo) (snapshot: RefSnapshot) : Result<FsckReport, string> =
@@ -136,14 +145,12 @@ module Fsck =
                             for childHash, childType in objectChildren objectValue do
                                 pending.Push(childHash, childType, introduced.Contains childHash)
                 | false, _ ->
-                    if checkedObjects.Add hash && not (ReadObjects.objectExists repo hash) then
-                        issues.Add(
-                            issue
-                                FsckSeverity.Error
-                                FsckIssueKind.Object
-                                (Some hash)
-                                None
-                                $"Object not found: {hash}")
+                    if checkedObjects.Add hash then
+                        match ReadObjects.readRawObject repo hash with
+                        | Error error -> issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
+                        | Ok (objectType, _) ->
+                            objectTypes.[hash] <- objectType
+                            checkExpectedType hash expectedType objectType
 
             Ok {
                 RefsChecked = tips.Length
@@ -152,6 +159,68 @@ module Fsck =
                 Issues = List.ofSeq issues
             }
         with ex -> Error $"Introduced-object fsck failed: {ex.Message}"
+
+    let private verifyOverlayCore
+        (verifyAll: bool)
+        (baseRepo: Repo)
+        (quarantine: Repo)
+        (updatedTips: GitHash seq)
+        (introducedObjects: GitHash seq) : Result<FsckReport, string> =
+        try
+            let introduced = HashSet<GitHash>(introducedObjects, StringComparer.Ordinal)
+            let tips = updatedTips |> Seq.distinct |> Seq.toArray
+            let issues = ResizeArray<FsckIssue>()
+            let checkedObjects = HashSet<GitHash>(StringComparer.Ordinal)
+            let types = Dictionary<GitHash, string>(StringComparer.Ordinal)
+            let pending = Stack<GitHash * string option>()
+            for tip in tips do pending.Push(tip, None)
+            for hash in introduced do pending.Push(hash, None)
+            while pending.Count > 0 do
+                let hash, expected = pending.Pop()
+                let mutable objectType = ""
+                if types.TryGetValue(hash, &objectType) then
+                    match expected with
+                    | Some t when t <> objectType ->
+                        issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None $"expected {t}, found {objectType}")
+                    | _ -> ()
+                elif checkedObjects.Add hash then
+                    let isNew = introduced.Contains hash
+                    let result = ReadObjects.readRawObject (if isNew then quarantine else baseRepo) hash
+                    match result with
+                    | Error error -> issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
+                    | Ok (t, content) ->
+                        types.[hash] <- t
+                        match expected with
+                        | Some e when e <> t ->
+                            issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None $"expected {e}, found {t}")
+                        | _ -> ()
+                        if isNew || verifyAll then
+                            match validateObjectId hash t content with
+                            | Error error -> issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
+                            | Ok () -> ()
+                            match parseRaw t content with
+                            | Error error -> issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
+                            | Ok value -> for child in objectChildren value do pending.Push child
+            Ok { RefsChecked = tips.Length; ObjectsChecked = checkedObjects.Count; PacksChecked = 0; Issues = List.ofSeq issues }
+        with ex -> Error $"Introduced-object fsck failed: {ex.Message}"
+
+    /// Validate introduced objects and accepted tips, using existing history as a boundary.
+    let verifyIntroducedOverlay
+        (baseRepo: Repo)
+        (quarantine: Repo)
+        (updatedTips: GitHash seq)
+        (introducedObjects: GitHash seq) : Result<FsckReport, string> =
+        verifyOverlayCore false baseRepo quarantine updatedTips introducedObjects
+
+    /// Verify full ref connectivity against quarantine plus existing objects.
+    let verifyReachableOverlay
+        (baseRepo: Repo)
+        (quarantine: Repo)
+        (newRefs: Map<string, GitHash>)
+        (introducedObjects: GitHash seq) : Result<FsckReport, string> =
+        let tips = newRefs |> Seq.map (fun (KeyValue(_, hash)) -> hash)
+        verifyOverlayCore true baseRepo quarantine tips introducedObjects
+        |> Result.map (fun report -> { report with RefsChecked = newRefs.Count })
 
     let private validateLooseObject (path: string) (expectedHash: GitHash) =
         try
@@ -194,7 +263,7 @@ module Fsck =
 
     let private hashBytes (hash: GitHash) = Convert.FromHexString hash
 
-    let private verifyPackPair (repo: Repo) (idxPath: string) (packPath: string) =
+    let internal verifyPackPair (repo: Repo) (idxPath: string) (packPath: string) =
         let issues = ResizeArray<FsckIssue>()
         let add kind objectId path message =
             issues.Add(issue FsckSeverity.Error kind objectId (Some path) message)

@@ -20,36 +20,51 @@ module PktLine =
     /// Frame a payload as a pkt-line.
     let encode (payload: byte[]) : byte[] =
         let len = payload.Length + 4
-        if len > 65520 then failwith "pkt-line payload too large"
+        if len > 65520 then invalidArg "payload" "pkt-line payload too large"
+        let result = Array.zeroCreate<byte> len
         let prefix = Encoding.ASCII.GetBytes(len.ToString("x4"))
-        Array.append prefix payload
+        Buffer.BlockCopy(prefix, 0, result, 0, 4)
+        Buffer.BlockCopy(payload, 0, result, 4, payload.Length)
+        result
 
     let encodeStr (s: string) : byte[] =
         encode (Encoding.UTF8.GetBytes s)
 
     /// Read the pkt-lines from a buffer starting at `pos`. Returns the packet and
     /// the new position. Stops the caller via Flush/Delim sentinels.
-    let read (buf: byte[]) (pos: int) : Pkt * int =
-        if pos + 4 > buf.Length then Flush, buf.Length
-        else
-            let lenHex = Encoding.ASCII.GetString(buf, pos, 4)
-            let len = Convert.ToInt32(lenHex, 16)
-            if len = 0 then Flush, pos + 4
-            elif len = 1 then Delim, pos + 4
-            else
-                let payloadLen = len - 4
-                let payload = buf.[pos + 4 .. pos + 4 + payloadLen - 1]
-                Data payload, pos + len
+    let private parseLength (buf: byte[]) (pos: int) =
+        if pos < 0 || pos > buf.Length - 4 then
+            raise (InvalidDataException "truncated pkt-line header")
+        let mutable length = 0
+        for index in pos .. pos + 3 do
+            let c = int buf.[index]
+            let digit =
+                if c >= 48 && c <= 57 then c - 48
+                elif c >= 97 && c <= 102 then c - 87
+                elif c >= 65 && c <= 70 then c - 55
+                else raise (InvalidDataException "invalid pkt-line length")
+            length <- length * 16 + digit
+        if length = 2 || length = 3 || length > 65520 then
+            raise (InvalidDataException "invalid pkt-line length")
+        length
 
-    /// Parse all pkt-lines from `pos` until a flush packet (or end of buffer).
+    let read (buf: byte[]) (pos: int) : Pkt * int =
+        let len = parseLength buf pos
+        if len = 0 then Flush, pos + 4
+        elif len = 1 then Delim, pos + 4
+        elif len > buf.Length - pos then
+            raise (InvalidDataException "truncated pkt-line payload")
+        else Data(buf.[pos + 4 .. pos + len - 1]), pos + len
+
+    /// Parse all pkt-lines from `pos` until a flush packet.
     /// Returns the data payloads and the position just past the flush.
     let readUntilFlush (buf: byte[]) (pos: int) : byte[] list * int =
         let rec loop p acc =
-            if p >= buf.Length then List.rev acc, p
+            if p >= buf.Length then raise (InvalidDataException "missing pkt-line flush")
             else
                 match read buf p with
                 | Flush, np -> List.rev acc, np
-                | Delim, np -> loop np acc
+                | Delim, _ -> raise (InvalidDataException "unexpected pkt-line delimiter")
                 | Data d, np -> loop np (d :: acc)
         loop pos []
 
@@ -62,9 +77,9 @@ module PktLine =
             let r = s.Read(hdr, off, 4 - off)
             if r = 0 then eof <- true else off <- off + r
         if off = 0 then None
-        elif off < 4 then None
+        elif off < 4 then raise (InvalidDataException "truncated pkt-line header")
         else
-            let len = Convert.ToInt32(Encoding.ASCII.GetString hdr, 16)
+            let len = parseLength hdr 0
             if len = 0 then Some Flush
             elif len = 1 then Some Delim
             else
@@ -73,7 +88,7 @@ module PktLine =
                 let mutable p = 0
                 while p < payloadLen do
                     let r = s.Read(payload, p, payloadLen - p)
-                    if r = 0 then failwith "truncated pkt-line"
+                    if r = 0 then raise (InvalidDataException "truncated pkt-line payload")
                     p <- p + r
                 Some(Data payload)
 

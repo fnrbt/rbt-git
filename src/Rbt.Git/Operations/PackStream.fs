@@ -169,7 +169,7 @@ module PackStream =
                             retainedBytes <- retainedBytes - evicted.Length
                         win.Add(entryStart, content, entryDepth)
                         windowBytes.[tn] <- retainedBytes + content.Length
-                | None -> ()
+                | None -> failwithf "cannot stream missing or unreadable object %s" id
 
         let trailer = hash.GetHashAndReset()
         if useSideband then

@@ -1,13 +1,13 @@
-// Sample usage of FSharpGit library
+// Sample usage of Rbt.Git
 // Build first: dotnet build
 // Then run: dotnet fsi examples/SampleUsage.fsx
 
-#r "../../../src/FSharpGit/bin/Debug/net10.0/FSharpGit.dll"
+#r "../src/Rbt.Git/bin/Debug/net10.0/Rbt.Git.dll"
 
-open FSharpGit
+open Rbt.Git
 open System
 
-printfn "F# Git Library - Sample Usage"
+printfn "Rbt.Git - Sample Usage"
 printfn "==============================="
 
 // Try to open a repository in current directory
@@ -30,9 +30,9 @@ match Repository.openRepo "." with
             printfn "Author: %s <%s>" commit.Author.Name commit.Author.Email
             printfn "Date: %O" commit.Author.Time
         | Error msg -> printfn "Error reading commit: %s" msg
-    | Ok (Symbolic ref) ->
-        printfn "HEAD (symbolic): %s" ref
-        match References.resolveReference repo ref with
+    | Ok (Symbolic refName) ->
+        printfn "HEAD (symbolic): %s" refName
+        match References.resolveReference repo refName with
         | Ok hash ->
             match ReadObjects.readCommit repo hash with
             | Ok commit ->
@@ -73,25 +73,15 @@ match Repository.openRepo "." with
             printfn "No changes"
         else
             for entry in entries do
-                let statusStr =
-                    if entry.IndexStatus = FileStatus.Unchanged && entry.WorkTreeStatus = FileStatus.Unchanged then
-                        "  "
-                    elif entry.IndexStatus = FileStatus.Unchanged && entry.WorkTreeStatus <> FileStatus.Unchanged then
-                        "??"
-                    elif entry.IndexStatus <> FileStatus.Unchanged && entry.WorkTreeStatus = FileStatus.Unchanged then
-                        "M "
-                    else
-                        "M "
-                printfn "%s %s" statusStr entry.Path
+                printfn "index=%A worktree=%A %s" entry.IndexStatus entry.WorkTreeStatus entry.Path
     | Error msg -> printfn "Error getting status: %s" msg
     
     // Try to get log
     printfn "\n--- Recent Commits ---"
-    match RepositoryOperations.getLog repo (Some 5) with
-    | Ok commits ->
-        for commit in commits do
-            let shortHash = commit.Tree.[0..6]
-            printfn "%s %s" shortHash commit.Message
+    match RepositoryOperations.getHead repo with
+    | Ok headHash ->
+        for commit, hash in CommitHistory.walkCommits repo headHash |> Seq.truncate 5 do
+            printfn "%s %s" hash.[0..6] commit.Message
     | Error msg -> printfn "Error getting log: %s" msg
 | Error msg ->
     printfn "Error opening repository: %s" msg

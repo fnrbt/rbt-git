@@ -24,72 +24,20 @@ module Remote =
         PackBytes: int64
     }
     
-    let private parseRemoteConfig (content: string) : RemoteRepo[] =
-        let lines = content.Split('\n')
-        let mutable remotes = ResizeArray<RemoteRepo>()
-        let mutable currentRemote: string option = None
-        let mutable fetchUrl: string option = None
-        let mutable pushUrl: string option = None
-        
-        let processLine (line: string) : unit =
-            let trimmed = line.Trim()
-            if trimmed.StartsWith "[remote \"" then
-                match currentRemote, fetchUrl, pushUrl with
-                | Some name, Some url, _ ->
-                    let remote = { Name = name; FetchUrl = url; PushUrl = pushUrl } : RemoteRepo
-                    remotes.Add remote |> ignore
-                | _ -> ()
-                
-                let endQuote = trimmed.IndexOf('"', 9)
-                if endQuote > 0 then
-                    currentRemote <- Some trimmed.[9..endQuote - 1]
-                    fetchUrl <- None
-                    pushUrl <- None
-                else
-                    currentRemote <- None
-                    fetchUrl <- None
-                    pushUrl <- None
-            elif trimmed.StartsWith "]" then
-                match currentRemote, fetchUrl, pushUrl with
-                | Some name, Some url, _ ->
-                    let remote = { Name = name; FetchUrl = url; PushUrl = pushUrl } : RemoteRepo
-                    remotes.Add remote |> ignore
-                | _ -> ()
-                currentRemote <- None
-                fetchUrl <- None
-                pushUrl <- None
-            elif trimmed.StartsWith "url" then
-                let parts = trimmed.Split('=')
-                if parts.Length >= 2 then
-                    fetchUrl <- Some (parts.[1].Trim())
-                    if Option.isNone pushUrl then
-                        pushUrl <- fetchUrl
-            elif trimmed.StartsWith "pushurl" then
-                let parts = trimmed.Split('=')
-                if parts.Length >= 2 then
-                    pushUrl <- Some (parts.[1].Trim())
-        
-        for line in lines do
-            processLine line
-        
-        match currentRemote, fetchUrl, pushUrl with
-        | Some name, Some url, _ ->
-            let remote = { Name = name; FetchUrl = url; PushUrl = pushUrl } : RemoteRepo
-            remotes.Add remote |> ignore
-        | _ -> ()
-        
-        remotes.ToArray()
-    
     let listRemotes (repo: Repo) : Result<RemoteRepo[], string> =
-        try
-            let configFile = Repository.getConfigFile repo
-            if not (File.Exists configFile) then
-                Ok [||]
-            else
-                let content = File.ReadAllText configFile
-                Ok (parseRemoteConfig content)
-        with
-        | ex -> Error $"Failed to list remotes: {ex.Message}"
+        GitConfig.readConfig repo
+        |> Result.map (fun config ->
+            GitConfig.getSections config "remote"
+            |> Array.choose (fun section -> section.Subsection)
+            |> Array.distinct
+            |> Array.choose (fun name ->
+                match GitConfig.getValue config "remote" (Some name) "url" with
+                | None -> None
+                | Some url ->
+                    let pushUrl =
+                        GitConfig.getValue config "remote" (Some name) "pushurl"
+                        |> Option.orElse (Some url)
+                    Some { Name = name; FetchUrl = url; PushUrl = pushUrl }))
     
     let getRemote (repo: Repo) (name: string) : Result<RemoteRepo option, string> =
         match listRemotes repo with
@@ -136,13 +84,14 @@ module Remote =
             let refs = Dictionary<string, GitHash>()
             let mutable headSymref = None
             let mutable pos = 0
+            let mutable finishedWithFlush = false
             while pos < body.Length do
                 match PktLine.read body pos with
-                | PktLine.Flush, np
-                | PktLine.Delim, np ->
-                    pos <- np
+                | PktLine.Flush, np -> pos <- np; finishedWithFlush <- true
+                | PktLine.Delim, _ -> raise (InvalidDataException "Unexpected advertisement delimiter")
                 | PktLine.Data d, np ->
                     pos <- np
+                    finishedWithFlush <- false
                     let line = Encoding.UTF8.GetString(d).TrimEnd('\n')
                     if not (line.StartsWith("# service=", StringComparison.Ordinal)) then
                         let nul = line.IndexOf('\000')
@@ -151,13 +100,24 @@ module Remote =
                         if caps <> "" then
                             for cap in caps.Split(' ', StringSplitOptions.RemoveEmptyEntries) do
                                 if cap.StartsWith("symref=HEAD:", StringComparison.Ordinal) then
-                                    headSymref <- Some(cap.Substring("symref=HEAD:".Length))
+                                    let target = cap.Substring("symref=HEAD:".Length)
+                                    if not (References.isValidName target) then
+                                        raise (InvalidDataException $"Invalid advertised HEAD target: {target}")
+                                    headSymref <- Some target
                         let pieces = refPart.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                        if pieces.Length >= 2 then
-                            let sha = pieces.[0].ToLowerInvariant()
-                            let name = pieces.[1]
-                            if sha <> zeroId && validHash sha && name <> "HEAD" && not (name.EndsWith("^{}", StringComparison.Ordinal)) then
+                        if pieces.Length <> 2 || not (validHash pieces.[0]) then
+                            raise (InvalidDataException "Malformed advertised ref")
+                        let sha = pieces.[0].ToLowerInvariant()
+                        let name = pieces.[1]
+                        if name <> "HEAD" && name <> "capabilities^{}" then
+                            let baseName = if name.EndsWith("^{}", StringComparison.Ordinal) then name.Substring(0, name.Length - 3) else name
+                            if not (References.isValidName baseName) then
+                                raise (InvalidDataException $"Invalid advertised ref name: {name}")
+                            if name = baseName then
+                                if sha = zeroId then raise (InvalidDataException $"Invalid zero object ID for ref {name}")
+                                if refs.ContainsKey name then raise (InvalidDataException $"Duplicate advertised ref: {name}")
                                 refs.[name] <- sha
+            if not finishedWithFlush then raise (InvalidDataException "Missing advertisement flush")
             Ok (refs |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq, headSymref)
         with ex ->
             Error("Failed to parse advertised refs: " + ex.Message)
@@ -174,57 +134,8 @@ module Remote =
             | Ok body -> return parseAdvertisedRefs body
         }
 
-    let private listLooseRefs (repo: Repo) =
-        let refsRoot = Repository.getRefsDir repo
-        if not (Directory.Exists refsRoot) then []
-        else
-            Directory.GetFiles(refsRoot, "*", SearchOption.AllDirectories)
-            |> Array.choose (fun path ->
-                let rel = Path.GetRelativePath(repo.GitDir, path).Replace('\\', '/')
-                if rel.EndsWith(".lock", StringComparison.Ordinal) then None
-                else
-                    let value = File.ReadAllText(path).Trim()
-                    if validHash value then Some(rel, value.ToLowerInvariant()) else None)
-            |> Array.toList
-
-    let private listLocalRefs (repo: Repo) =
-        let packed =
-            match References.readPackedRefs repo with
-            | Ok refs ->
-                refs
-                |> Array.choose (fun (name, hash) ->
-                    if name.EndsWith("^{}", StringComparison.Ordinal) then None
-                    elif validHash hash then Some(name, hash.ToLowerInvariant())
-                    else None)
-                |> Array.toList
-            | Error _ -> []
-        (packed @ listLooseRefs repo)
-        |> List.fold (fun acc (name, hash) -> Map.add name hash acc) Map.empty
-
-    let private writeFullRef (repo: Repo) (name: string) (hash: GitHash) =
-        if name.StartsWith("refs/", StringComparison.Ordinal) then
-            let path = Path.Combine(repo.GitDir, name.Replace('/', Path.DirectorySeparatorChar))
-            Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
-            File.WriteAllText(path, hash + "\n")
-
-    let private removeFromPackedRefs (repo: Repo) (names: Set<string>) =
-        let packed = Repository.getPackedRefsFile repo
-        if File.Exists packed && not (Set.isEmpty names) then
-            let lines = File.ReadAllLines packed
-            let kept =
-                lines
-                |> Array.filter (fun line ->
-                    let trimmed = line.Trim()
-                    if trimmed = "" || trimmed.StartsWith("#", StringComparison.Ordinal) || trimmed.StartsWith("^", StringComparison.Ordinal) then true
-                    else
-                        let parts = trimmed.Split(' ', 2)
-                        parts.Length < 2 || not (Set.contains parts.[1] names))
-            File.WriteAllLines(packed, kept)
-
-    let private deleteFullRef (repo: Repo) (name: string) =
-        if name.StartsWith("refs/", StringComparison.Ordinal) then
-            let path = Path.Combine(repo.GitDir, name.Replace('/', Path.DirectorySeparatorChar))
-            if File.Exists path then File.Delete path
+    let private listLocalRefs (repo: Repo) : Result<Map<string, GitHash>, string> =
+        References.snapshot repo RefPolicy.Replication |> Result.map (fun snapshot -> snapshot.Refs)
 
     let private pkt (s: string) = PktLine.encodeStr s
 
@@ -284,34 +195,6 @@ module Remote =
         with ex ->
             Error("Failed to extract upload-pack response: " + ex.Message)
 
-    let private fetchPack (repo: Repo) (remoteUrl: string) (auth: HttpAuth option) (wants: GitHash list) (haves: GitHash list) =
-        task {
-            if List.isEmpty wants then
-                return Ok(0, 0L)
-            else
-                use client = new HttpClient()
-                let reqBody = buildUploadPackRequest wants haves
-                use req = new HttpRequestMessage(HttpMethod.Post, serviceUrl remoteUrl "/git-upload-pack")
-                applyAuth req auth
-                req.Content <- new ByteArrayContent(reqBody)
-                req.Content.Headers.ContentType <- MediaTypeHeaderValue("application/x-git-upload-pack-request")
-                req.Headers.Accept.Add(MediaTypeWithQualityHeaderValue("application/x-git-upload-pack-result"))
-                let! res = httpBytes client req
-                match res with
-                | Error e -> return Error e
-                | Ok body ->
-                    match extractPack body with
-                    | Error e -> return Error e
-                    | Ok (packBytes, _) ->
-                        if packBytes.Length = 0 then
-                            return Ok(0, 0L)
-                        else
-                            use input = new MemoryStream(packBytes)
-                            let counting = new PackData.CountingStream(input)
-                            match PackWriter.unpackPackStream repo counting with
-                            | Ok written -> return Ok(written.Length, int64 packBytes.Length)
-                            | Error e -> return Error e
-        }
 
     type private RefspecMapping =
         | Prefix of sourcePrefix: string * destinationPrefix: string
@@ -329,17 +212,14 @@ module Remote =
             let destination = parts.[1]
             let sourceWildcards = source |> Seq.filter ((=) '*') |> Seq.length
             let destinationWildcards = destination |> Seq.filter ((=) '*') |> Seq.length
-            let validRefName (name: string) =
-                name.StartsWith("refs/", StringComparison.Ordinal) &&
-                not (name.Contains("..", StringComparison.Ordinal)) &&
-                not (name.Contains("\\", StringComparison.Ordinal))
+            let validRefName (name: string) = References.isValidName name
             if sourceWildcards = 0 && destinationWildcards = 0 && validRefName source && validRefName destination then
                 Ok(Exact(source, destination))
             elif sourceWildcards = 1 && destinationWildcards = 1 &&
                  source.EndsWith("/*", StringComparison.Ordinal) &&
                  destination.EndsWith("/*", StringComparison.Ordinal) &&
-                 validRefName (source.Substring(0, source.Length - 1)) &&
-                 validRefName (destination.Substring(0, destination.Length - 1)) then
+                 validRefName (source.Substring(0, source.Length - 1) + "item") &&
+                 validRefName (destination.Substring(0, destination.Length - 1) + "item") then
                 Ok(Prefix(source.Substring(0, source.Length - 1), destination.Substring(0, destination.Length - 1)))
             else
                 Error("Unsupported fetch refspec: " + spec)
@@ -371,11 +251,13 @@ module Remote =
                     match destination with
                     | None -> ()
                     | Some name ->
-                        match mapped.TryGetValue name with
-                        | true, existing when existing <> hash ->
-                            conflict <- Some(sprintf "Multiple remote refs map to %s" name)
-                        | _ ->
-                            mapped.[name] <- hash
+                        if not (References.isValidName name) then
+                            conflict <- Some(sprintf "Invalid mapped ref: %s" name)
+                        else
+                            match mapped.TryGetValue name with
+                            | true, existing when existing <> hash ->
+                                conflict <- Some(sprintf "Multiple remote refs map to %s" name)
+                            | _ -> mapped.[name] <- hash
             let pruneAppliesTo name =
                 parsed
                 |> Seq.exists (function
@@ -386,63 +268,6 @@ module Remote =
             | None ->
                 Ok(mapped |> Seq.map (fun kv -> kv.Key, kv.Value) |> Map.ofSeq, pruneAppliesTo)
 
-    let private updateHeadSymref (repo: Repo) (headSymref: string option) (remoteRefs: Map<string, GitHash>) =
-        match headSymref with
-        | Some target when target.StartsWith("refs/", StringComparison.Ordinal) && Map.containsKey target remoteRefs ->
-            References.updateHead repo (Symbolic target) |> ignore
-        | _ -> ()
-
-    let private fetchMirrorHttp (repo: Repo) (remoteUrl: string) (auth: HttpAuth option) (refspecs: string list) (prune: bool) =
-        task {
-            let! adv = advertiseUploadPack remoteUrl auth
-            match adv with
-            | Error e -> return Error e
-            | Ok (advertisedRefs, headSymref) ->
-                match refsForRefspecs advertisedRefs refspecs with
-                | Error e -> return Error e
-                | Ok (remoteRefs, pruneAppliesTo) ->
-                    let localRefs = listLocalRefs repo
-                    let wants =
-                        remoteRefs
-                        |> Map.toSeq
-                        |> Seq.map snd
-                        |> Seq.distinct
-                        |> Seq.filter (fun h -> not (ReadObjects.objectExists repo h))
-                        |> Seq.toList
-                    let haves =
-                        localRefs
-                        |> Map.toSeq
-                        |> Seq.map snd
-                        |> Seq.distinct
-                        |> Seq.toList
-                    let! packRes = fetchPack repo remoteUrl auth wants haves
-                    match packRes with
-                    | Error e -> return Error e
-                    | Ok (objectCount, packBytes) ->
-                        let updated = ResizeArray<string * GitHash>()
-                        for KeyValue(name, hash) in remoteRefs do
-                            if Map.tryFind name localRefs <> Some hash then
-                                writeFullRef repo name hash
-                                updated.Add(name, hash)
-                        let pruned =
-                            if prune then
-                                localRefs
-                                |> Map.toSeq
-                                |> Seq.map fst
-                                |> Seq.filter (fun name -> pruneAppliesTo name && not (Map.containsKey name remoteRefs))
-                                |> Seq.toList
-                            else []
-                        for name in pruned do deleteFullRef repo name
-                        removeFromPackedRefs repo (Set.ofList pruned)
-                        updateHeadSymref repo headSymref remoteRefs
-                        return Ok {
-                            RemoteRefs = remoteRefs
-                            UpdatedRefs = List.ofSeq updated
-                            PrunedRefs = pruned
-                            ObjectCount = objectCount
-                            PackBytes = packBytes
-                        }
-        }
 
     /// Fetch a mirror through a caller-supplied authenticated transport.
     /// The callbacks exchange ordinary smart-HTTP advertisement and
@@ -453,31 +278,61 @@ module Remote =
         (uploadPack: byte[] -> Result<byte[], string>)
         (refspecs: string list)
         (prune: bool) : Result<FetchReport, string> =
-        let finish remoteRefs headSymref pruneAppliesTo localRefs objectCount packByteCount =
-            let updated = ResizeArray<string * GitHash>()
-            for KeyValue(name, hash) in remoteRefs do
-                if Map.tryFind name localRefs <> Some hash then
-                    writeFullRef repo name hash
-                    updated.Add(name, hash)
-            let pruned =
-                if prune then
-                    localRefs
-                    |> Map.toSeq
-                    |> Seq.map fst
-                    |> Seq.filter (fun name -> pruneAppliesTo name && not (Map.containsKey name remoteRefs))
-                    |> Seq.toList
+        let invalidBranchTarget (readRaw: GitHash -> Result<string * byte[], string>) (refs: Map<string, GitHash>) =
+            refs
+            |> Map.exists (fun name hash ->
+                (name.StartsWith("refs/heads/", StringComparison.Ordinal) ||
+                 name.StartsWith("refs/remotes/", StringComparison.Ordinal)) &&
+                (match readRaw hash with
+                 | Ok ("commit", _) -> false
+                 | _ -> true))
+
+        let finish validated remoteRefs headSymref pruneAppliesTo localRefs objectCount packByteCount =
+            let connectivity =
+                if validated then Ok ()
                 else
-                    []
-            for name in pruned do deleteFullRef repo name
-            removeFromPackedRefs repo (Set.ofList pruned)
-            updateHeadSymref repo headSymref remoteRefs
-            {
-                RemoteRefs = remoteRefs
-                UpdatedRefs = List.ofSeq updated
-                PrunedRefs = pruned
-                ObjectCount = objectCount
-                PackBytes = packByteCount
-            }
+                    match Fsck.verifyReachable repo { Head = Symbolic ""; Refs = remoteRefs; Digest = "" } with
+                    | Error error -> Error error
+                    | Ok report when not report.IsValid -> Error "Fetched refs have incomplete or invalid object connectivity"
+                    | Ok _ -> Ok ()
+            match connectivity with
+            | Error error -> Error error
+            | Ok () when invalidBranchTarget (ReadObjects.readRawObject repo) remoteRefs ->
+                Error "Fetched branch does not target a commit"
+            | Ok () ->
+                let updated = ResizeArray<string * GitHash>()
+                let pruned = ResizeArray<string>()
+                let mutable failure = None
+                for KeyValue(name, hash) in remoteRefs do
+                    if Map.tryFind name localRefs <> Some hash && Option.isNone failure then
+                        match References.compareAndSwap repo name (Map.tryFind name localRefs) (Some hash) with
+                        | Ok () -> updated.Add(name, hash)
+                        | Error error -> failure <- Some error
+                if prune && Option.isNone failure then
+                    for KeyValue(name, hash) in localRefs do
+                        if pruneAppliesTo name && not (Map.containsKey name remoteRefs) && Option.isNone failure then
+                            match References.compareAndSwap repo name (Some hash) None with
+                            | Ok () -> pruned.Add name
+                            | Error error -> failure <- Some error
+                match failure with
+                | Some error -> Error error
+                | None ->
+                    match headSymref with
+                    | Some target when Map.containsKey target remoteRefs ->
+                        match References.updateHead repo (Symbolic target) with
+                        | Error error -> failure <- Some error
+                        | Ok () -> ()
+                    | _ -> ()
+                    match failure with
+                    | Some error -> Error error
+                    | None ->
+                        Ok {
+                            RemoteRefs = remoteRefs
+                            UpdatedRefs = List.ofSeq updated
+                            PrunedRefs = List.ofSeq pruned
+                            ObjectCount = objectCount
+                            PackBytes = packByteCount
+                        }
 
         match advertise () with
         | Error error -> Error error
@@ -485,10 +340,9 @@ module Remote =
             match parseAdvertisedRefs advertisement with
             | Error error -> Error error
             | Ok (advertisedRefs, headSymref) ->
-                match refsForRefspecs advertisedRefs refspecs with
-                | Error error -> Error error
-                | Ok (remoteRefs, pruneAppliesTo) ->
-                    let localRefs = listLocalRefs repo
+                match refsForRefspecs advertisedRefs refspecs, listLocalRefs repo with
+                | Error error, _ | _, Error error -> Error error
+                | Ok (remoteRefs, pruneAppliesTo), Ok localRefs ->
                     let wants =
                         remoteRefs
                         |> Map.toSeq
@@ -496,14 +350,9 @@ module Remote =
                         |> Seq.distinct
                         |> Seq.filter (fun hash -> not (ReadObjects.objectExists repo hash))
                         |> Seq.toList
-                    let haves =
-                        localRefs
-                        |> Map.toSeq
-                        |> Seq.map snd
-                        |> Seq.distinct
-                        |> Seq.toList
+                    let haves = localRefs |> Map.toSeq |> Seq.map snd |> Seq.distinct |> Seq.toList
                     if List.isEmpty wants then
-                        Ok(finish remoteRefs headSymref pruneAppliesTo localRefs 0 0L)
+                        finish false remoteRefs headSymref pruneAppliesTo localRefs 0 0L
                     else
                         match uploadPack (buildUploadPackRequest wants haves) with
                         | Error error -> Error error
@@ -511,22 +360,56 @@ module Remote =
                             match extractPack response with
                             | Error error -> Error error
                             | Ok (packBytes, _) when packBytes.Length = 0 ->
-                                Ok(finish remoteRefs headSymref pruneAppliesTo localRefs 0 0L)
+                                Error "Remote did not provide the requested pack"
                             | Ok (packBytes, _) ->
-                                use input = new MemoryStream(packBytes)
-                                let counting = new PackData.CountingStream(input)
-                                match PackWriter.unpackPackStream repo counting with
-                                | Error error -> Error error
-                                | Ok written ->
-                                    Ok(finish remoteRefs headSymref pruneAppliesTo localRefs written.Length (int64 packBytes.Length))
+                                let quarantinePath = repo.GitDir + ".fetch-quarantine-" + Guid.NewGuid().ToString("N")
+                                try
+                                    match Repository.initBare quarantinePath with
+                                    | Error error -> Error error
+                                    | Ok quarantine ->
+                                        use input = new MemoryStream(packBytes)
+                                        use counting = new PackData.CountingStream(input)
+                                        match PackWriter.unpackPackStreamInto repo quarantine counting with
+                                        | Error error -> Error error
+                                        | Ok written ->
+                                            match Fsck.verifyReachableOverlay repo quarantine remoteRefs written with
+                                            | Error error -> Error error
+                                            | Ok report when not report.IsValid ->
+                                                Error "Fetched refs have incomplete or invalid object connectivity"
+                                            | Ok _ ->
+                                                let incoming = HashSet<GitHash>(written, StringComparer.Ordinal)
+                                                let readRaw hash =
+                                                    ReadObjects.readRawObject (if incoming.Contains hash then quarantine else repo) hash
+                                                if invalidBranchTarget readRaw remoteRefs then
+                                                    Error "Fetched branch does not target a commit"
+                                                else
+                                                    match PackWriter.promoteLooseObjects quarantine repo written with
+                                                    | Error error -> Error error
+                                                    | Ok () ->
+                                                        finish true remoteRefs headSymref pruneAppliesTo localRefs written.Length (int64 packBytes.Length)
+                                finally
+                                    try
+                                        if Directory.Exists quarantinePath then Directory.Delete(quarantinePath, true)
+                                    with _ -> ()
 
     let fetchMirrorWithAuth (repo: Repo) (remoteUrl: string) (auth: HttpAuth option) (refspecs: string list) (prune: bool) : Result<FetchReport, string> =
         if not (remoteUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || remoteUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) then
             Error "Only HTTP(S) mirror fetch is implemented"
         else
-            fetchMirrorHttp repo remoteUrl auth refspecs prune
-            |> Async.AwaitTask
-            |> Async.RunSynchronously
+            let advertise () =
+                use client = new HttpClient()
+                use request = new HttpRequestMessage(HttpMethod.Get, serviceUrl remoteUrl "/info/refs?service=git-upload-pack")
+                applyAuth request auth
+                httpBytes client request |> Async.AwaitTask |> Async.RunSynchronously
+            let uploadPack requestBody =
+                use client = new HttpClient()
+                use request = new HttpRequestMessage(HttpMethod.Post, serviceUrl remoteUrl "/git-upload-pack")
+                applyAuth request auth
+                request.Content <- new ByteArrayContent(requestBody)
+                request.Content.Headers.ContentType <- MediaTypeHeaderValue("application/x-git-upload-pack-request")
+                request.Headers.Accept.Add(MediaTypeWithQualityHeaderValue("application/x-git-upload-pack-result"))
+                httpBytes client request |> Async.AwaitTask |> Async.RunSynchronously
+            fetchMirrorWithTransport repo advertise uploadPack refspecs prune
 
     let fetchMirror (repo: Repo) (remoteUrl: string) (refspecs: string list) (prune: bool) : Result<FetchReport, string> =
         fetchMirrorWithAuth repo remoteUrl None refspecs prune
@@ -537,14 +420,11 @@ module Remote =
         |> Async.RunSynchronously
         |> Result.map fst
 
-    let private gitProtocolFetch (remoteUrl: string) (refs: string[]) : Result<Map<string, GitHash>, string> =
-        Error "Git protocol fetch not yet implemented"
-    
-    let private httpFetch (remoteUrl: string) (refs: string[]) : Result<Map<string, GitHash>, string> =
-        lsRemoteHttp remoteUrl None
-    
-    let private sshFetch (remoteUrl: string) (refs: string[]) : Result<Map<string, GitHash>, string> =
-        Error "SSH fetch not yet implemented"
+    let private gitProtocolFetch (_remoteUrl: string) (_refs: string[]) : Result<Map<string, GitHash>, string> =
+        Error "Git protocol fetch is unsupported"
+
+    let private sshFetch (_remoteUrl: string) (_refs: string[]) : Result<Map<string, GitHash>, string> =
+        Error "SSH fetch is unsupported"
     
     let fetch (repo: Repo) (remote: string) : Result<unit, string> =
         match getRemote repo remote with
@@ -573,7 +453,7 @@ module Remote =
                 | Ok _ -> Ok ()
                 | Error msg -> Error msg
             | "file" ->
-                Ok ()
+                Error "File transport fetch is unsupported; no refs or objects were changed"
             | _ ->
                 Error $"Unsupported protocol: {protocol}"
         | Ok None -> Error $"Remote not found: {remote}"
@@ -596,40 +476,23 @@ module Remote =
         | Ok None -> Error $"Remote not found: {remote}"
         | Error msg -> Error msg
     
+    let private validRemoteName (name: string) =
+        not (String.IsNullOrEmpty name) &&
+        References.isValidName ("refs/remotes/" + name + "/test")
+
     let addRemote (repo: Repo) (name: string) (url: string) : Result<unit, string> =
-        try
-            let configFile = Repository.getConfigFile repo
-            let mutable content = if File.Exists configFile then File.ReadAllText configFile else ""
-            
-            let section = $"\n[remote \"{name}\"]\n\turl = {url}\n"
-            if content.Contains($"[remote \"{name}\"]") then
-                Error $"Remote {name} already exists"
-            else
-                content <- content + section
-                File.WriteAllText(configFile, content)
-                Ok ()
-        with
-        | ex -> Error $"Failed to add remote: {ex.Message}"
-    
+        if not (validRemoteName name) then Error $"Invalid remote name: {name}"
+        elif String.IsNullOrWhiteSpace url then Error "Remote URL must not be empty"
+        else
+            GitConfig.updateConfig repo (fun config ->
+                if GitConfig.hasSection config "remote" (Some name) then
+                    Error $"Remote {name} already exists"
+                else Ok(GitConfig.setValue config "remote" (Some name) "url" url))
+
     let removeRemote (repo: Repo) (name: string) : Result<unit, string> =
-        try
-            let configFile = Repository.getConfigFile repo
-            if not (File.Exists configFile) then
-                Ok ()
-            else
-                let content = File.ReadAllText configFile
-                let startTag = $"[remote \"{name}\"]"
-                let startIndex = content.IndexOf startTag
-                if startIndex < 0 then
-                    Error $"Remote {name} not found"
-                else
-                    let endIndex = content.IndexOf("\n[", startIndex + 1)
-                    let newContent =
-                        if endIndex > 0 then
-                            content.[0..startIndex - 1] + content.[endIndex..]
-                        else
-                            content.[0..startIndex - 1]
-                    File.WriteAllText(configFile, newContent)
-                    Ok ()
-        with
-        | ex -> Error $"Failed to remove remote: {ex.Message}"
+        if not (validRemoteName name) then Error $"Invalid remote name: {name}"
+        else
+            GitConfig.updateConfig repo (fun config ->
+                if GitConfig.hasSection config "remote" (Some name) then
+                    Ok(GitConfig.removeSection config "remote" (Some name))
+                else Error $"Remote {name} not found")
