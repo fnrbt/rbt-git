@@ -259,7 +259,7 @@ Git config file parsing and manipulation.
 `ConfigSection.Values : Map<string, string>` remains a last-value view; do not
 use it to enumerate repeated settings. `getValues config section subsection key`
 returns a `string[]` in configuration order. Code constructing `ConfigSection`
-records must populate `Entries` as well as `Values`.
+records must populate `Entries`; `Values` is computed and is not a record field.
 
 Worktree status reads `core.filemode` and `core.excludesfile` from direct
 system, XDG, user, and repository config files. It does not expand
