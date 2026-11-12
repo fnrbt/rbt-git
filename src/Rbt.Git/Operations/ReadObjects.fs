@@ -31,6 +31,19 @@ module ReadObjects =
             | Some (t, content) -> parseRaw t content
             | None -> Error $"Object not found: {hash}"
 
+    /// readObject through an open pack session. PackStore.tryRead opens a new
+    /// session (indexing every packed object) per call, so a walk that reads
+    /// many objects keeps one session for all of them.
+    /// TODO: share one session per repository in tryRead itself; that needs
+    /// invalidation when packs change, so walks pass their own for now.
+    let readObjectWith (session: PackStore.ReadSession) (repo: Repo) (hash: GitHash) : Result<GitObject, string> =
+        match tryReadLooseObject repo hash with
+        | Ok obj -> Ok obj
+        | Error _ ->
+            match session.TryRead hash with
+            | Some (t, content) -> parseRaw t content
+            | None -> Error $"Object not found: {hash}"
+
     /// Read an object's exact (typeName, contentBytes) without parsing, so the
     /// bytes can be re-served or re-packed with an identical hash. Loose objects
     /// preserve their bytes exactly; packed objects fall back to canonical

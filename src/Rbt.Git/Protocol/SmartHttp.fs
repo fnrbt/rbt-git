@@ -198,7 +198,7 @@ module SmartHttp =
                 // history reachable from the haves, so the pack stays incremental
                 // even though we never ACKed a specific common.
                 let commonHaves = haves |> Seq.filter (ReadObjects.objectExists repo) |> Seq.toArray
-                let objs = PackWriter.objectClosure repo (wants.ToArray()) commonHaves
+                let objs = PackWriter.objectClosureFor repo (wants.ToArray()) commonHaves clientShallow
                 PktLine.writeStr output "NAK\n"
                 PackStream.writeTo repo objs useDelta useSideband output
                 Ok()
@@ -320,7 +320,7 @@ module SmartHttp =
                 if depth > 0 then fst (PackWriter.objectClosureShallow repo (wants.ToArray()) (resolvedDepth ()))
                 else
                     let commonHaves = haves |> Seq.filter (ReadObjects.objectExists repo) |> Seq.toArray
-                    PackWriter.objectClosure repo (wants.ToArray()) commonHaves
+                    PackWriter.objectClosureFor repo (wants.ToArray()) commonHaves clientShallow
             PackStream.writeTo repo objs useDelta useSideband output
             Ok()
 
@@ -631,7 +631,7 @@ module SmartHttp =
                 PktLine.writeStr output "packfile\n"
                 let objects =
                     if depth > 0 then fst (PackWriter.objectClosureShallow repo wants depth)
-                    else PackWriter.objectClosure repo wants (haves |> List.filter (ReadObjects.objectExists repo) |> List.toArray)
+                    else PackWriter.objectClosureFor repo wants (haves |> List.filter (ReadObjects.objectExists repo) |> List.toArray) clientShallow
                 PackStream.writeTo repo objects useDelta true output
 
             if doneSeen || List.isEmpty haves then

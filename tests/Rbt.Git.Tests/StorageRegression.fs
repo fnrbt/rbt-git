@@ -65,6 +65,41 @@ let run () =
         for _ in 1 .. 1500 do longTip <- writeLong [| longTip |]
         let longClosure = PackWriter.objectClosure longRepo [| longTip |] [||] |> Set.ofArray
         check (longClosure.Contains first && longClosure.Contains longTip) "long commit history closure is incomplete"
+        // An incremental fetch must cost the new history, not the repository:
+        // 0.2.0 walked every object reachable from the haves first, so a fetch
+        // of one commit from a large repository ran for minutes with no output.
+        let fetchRepo = Repository.initBare (Path.Combine(root, "fetch.git")) |> value
+        let at seconds = { signature with Time = DateTimeOffset.FromUnixTimeSeconds(1_000_000L + int64 seconds) }
+        let shared = ObjectWriter.writeBlob fetchRepo (Encoding.UTF8.GetBytes "shared") |> value
+        let snapshot i =
+            let own = ObjectWriter.writeBlob fetchRepo (Encoding.UTF8.GetBytes(sprintf "commit %d" i)) |> value
+            let sub = ObjectWriter.writeTree fetchRepo [| { Mode = 0o100644; Path = "own"; Hash = own } |] |> value
+            ObjectWriter.writeTree fetchRepo [| { Mode = 0o100644; Path = "shared"; Hash = shared }; { Mode = 0o040000; Path = "sub"; Hash = sub } |] |> value, own, sub
+        let commitAt i parents =
+            let tree, _, _ = snapshot i
+            ObjectWriter.writeCommit fetchRepo { Tree = tree; Parents = parents; Author = at i; Committer = at i; Message = sprintf "c%d\n" i } |> value
+        let history = ResizeArray<GitHash>()
+        history.Add(commitAt 0 [||])
+        for i in 1 .. 2000 do history.Add(commitAt i [| history.[i - 1] |])
+        let have = history.[1999]
+        let next = history.[2000]
+        let nextTree, nextOwn, nextSub = snapshot 2000
+        let incremental = PackWriter.objectClosure fetchRepo [| next |] [| have |] |> Set.ofArray
+        check (incremental = Set.ofList [ next; nextTree; nextOwn; nextSub ]) (sprintf "incremental closure sent %d objects, expected 4" incremental.Count)
+        // A side branch forked deep in history and merged into the tip: its
+        // commits are new, the fork point and everything below it are not.
+        let side = commitAt 2001 [| history.[10] |]
+        let merge = commitAt 2002 [| next; side |]
+        let merged = PackWriter.objectClosure fetchRepo [| merge |] [| have |] |> Set.ofArray
+        check (merged.Contains merge && merged.Contains side && merged.Contains next) "merge closure is missing new commits"
+        check (not (merged.Contains history.[10]) && not (merged.Contains history.[1999]) && not (merged.Contains shared)) "merge closure resent common history"
+        // A shallow client lacks the parents of its shallow commits, so the
+        // fork point below its boundary must be sent with the side branch.
+        let shallowMerged = PackWriter.objectClosureFor fetchRepo [| merge |] [| have |] [ history.[1990] ] |> Set.ofArray
+        check (shallowMerged.Contains side && shallowMerged.Contains history.[10] && shallowMerged.Contains history.[0]) "shallow client closure omitted history below its boundary"
+        check (not (shallowMerged.Contains history.[1995])) "shallow client closure resent commits above its boundary"
+        check (PackWriter.objectClosure fetchRepo [| have |] [| have |] = [||]) "closure of a common tip is not empty"
+        check ((PackWriter.objectClosure fetchRepo [| next |] [| String.replicate 40 "2" |] |> Set.ofArray).Contains history.[0]) "closure with an unknown have is incomplete"
         let missing = String.replicate 40 "1"
         use output = new MemoryStream()
         let mutable failed = false

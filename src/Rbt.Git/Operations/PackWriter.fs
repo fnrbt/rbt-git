@@ -35,42 +35,171 @@ module PackWriter =
 
     // ---- object closure ----------------------------------------------------
 
-    /// Traverse every object edge, stopping at known common commits.
-    let objectClosure (repo: Repo) (wants: GitHash[]) (haves: GitHash[]) : GitHash[] =
-        let excluded = HashSet<GitHash>()
-        let walk (seen: HashSet<GitHash>) (stops: HashSet<GitHash>) (roots: GitHash[]) =
-            let examined = HashSet<GitHash>()
-            let pending = Queue<GitHash * string option>()
-            for root in roots do pending.Enqueue(root, None)
-            let enqueue hash expected =
-                if expected = Some "blob" then
-                    if not (stops.Contains hash) then seen.Add hash |> ignore
-                else pending.Enqueue(hash, expected)
-            while pending.Count > 0 do
-                let hash, expected = pending.Dequeue()
-                if not (stops.Contains hash) && examined.Add hash then
-                    seen.Add hash |> ignore
-                    match ReadObjects.readObject repo hash with
-                    | Error error -> failwithf "reading %s: %s" hash error
-                    | Ok value ->
-                        let actual = ObjectWriter.objectTypeName value
-                        match expected with
-                        | Some t when t <> actual -> failwithf "object %s: expected %s, found %s" hash t actual
+    /// Objects to send for `wants` to a client that has `haves` and everything
+    /// reachable from them, where `clientShallow` lists the client's shallow
+    /// commits (their parents are not on the client).
+    ///
+    /// Commits are walked newest first from both sides together, and the walk
+    /// ends once every queued commit is one the client has. Each new commit's
+    /// tree is then compared path by path with its parents' trees, and only
+    /// what differs is read further. The cost therefore follows the new
+    /// history, not the repository: walking every object reachable from the
+    /// haves (0.2.0) made an incremental fetch of a large repository read its
+    /// whole history first, which ran for minutes with no output.
+    ///
+    /// Clock skew can make the walk include commits the client already has;
+    /// that only enlarges the pack. Nothing the client lacks is excluded.
+    let objectClosureFor (repo: Repo) (wants: GitHash[]) (haves: GitHash[]) (clientShallow: seq<GitHash>) : GitHash[] =
+        let shallow = HashSet<GitHash>(clientShallow, StringComparer.Ordinal)
+        use session = new PackStore.ReadSession(repo)
+        let readObject hash = ReadObjects.readObjectWith session repo hash
+        let read (hash: GitHash) (expected: string option) =
+            match readObject hash with
+            | Error error -> failwithf "reading %s: %s" hash error
+            | Ok value ->
+                let actual = ObjectWriter.objectTypeName value
+                match expected with
+                | Some t when t <> actual -> failwithf "object %s: expected %s, found %s" hash t actual
+                | _ -> value
+        let commits = Dictionary<GitHash, CommitData>(StringComparer.Ordinal)
+        let commitOf (hash: GitHash) =
+            match commits.TryGetValue hash with
+            | true, commit -> commit
+            | _ ->
+                match read hash (Some "commit") with
+                | Commit commit ->
+                    commits.[hash] <- commit
+                    commit
+                | _ -> failwithf "object %s is not a commit" hash
+
+        let included = HashSet<GitHash>(StringComparer.Ordinal)
+        let wantCommits = ResizeArray<GitHash>()
+        let wantTrees = ResizeArray<GitHash>()
+        let rec peelWant (hash: GitHash) (expected: string option) =
+            match read hash expected with
+            | Tag tag ->
+                included.Add hash |> ignore
+                peelWant tag.Object (Some tag.ObjectType)
+            | Commit commit ->
+                commits.[hash] <- commit
+                wantCommits.Add hash
+            | Tree _ -> wantTrees.Add hash
+            | Blob _ -> included.Add hash |> ignore
+        for want in wants do peelWant want None
+
+        // A have the client claims but this repository lacks, or one that is
+        // not a commit, says nothing about history; it is skipped.
+        let rec peelHave (hash: GitHash) depth =
+            if depth > 16 then None
+            else
+                match readObject hash with
+                | Ok (Commit commit) ->
+                    commits.[hash] <- commit
+                    Some hash
+                | Ok (Tag tag) -> peelHave tag.Object (depth + 1)
+                | _ -> None
+
+        let uninteresting = HashSet<GitHash>(StringComparer.Ordinal)
+        let interesting = HashSet<GitHash>(StringComparer.Ordinal)
+        let propagated = HashSet<GitHash>(StringComparer.Ordinal)
+        let queue = PriorityQueue<GitHash, struct (int64 * int64)>()
+        let mutable sequence = 0L
+        let enqueue (hash: GitHash) (commit: CommitData) =
+            sequence <- sequence + 1L
+            queue.Enqueue(hash, struct (-commit.Committer.Time.ToUnixTimeSeconds(), sequence))
+        for have in haves do
+            match peelHave have 0 with
+            | Some hash when uninteresting.Add hash -> enqueue hash commits.[hash]
+            | _ -> ()
+        for hash in wantCommits do
+            if not (uninteresting.Contains hash) && interesting.Add hash then enqueue hash commits.[hash]
+
+        let anyInterestingQueued () =
+            queue.UnorderedItems |> Seq.exists (fun struct (hash, _) -> not (uninteresting.Contains hash))
+        let newCommits = ResizeArray<GitHash>()
+        while queue.Count > 0 && anyInterestingQueued () do
+            let hash = queue.Dequeue()
+            if uninteresting.Contains hash then
+                if propagated.Add hash && not (shallow.Contains hash) then
+                    for parent in commits.[hash].Parents do
+                        // History the server lacks below a common commit is the
+                        // client's own business, not something to send.
+                        match peelHave parent 0 with
+                        | Some parentHash when uninteresting.Add parentHash -> enqueue parentHash commits.[parentHash]
                         | _ -> ()
-                        match value with
-                        | Commit commit ->
-                            enqueue commit.Tree (Some "tree")
-                            for parent in commit.Parents do enqueue parent (Some "commit")
-                        | Tree entries ->
-                            for entry in entries do
-                                if entry.Mode = 0o040000 then enqueue entry.Hash (Some "tree")
-                                elif entry.Mode <> 0o160000 then enqueue entry.Hash (Some "blob")
-                        | Tag tag -> enqueue tag.Object (Some tag.ObjectType)
-                        | Blob _ -> ()
-        walk excluded (HashSet<GitHash>()) haves
-        let included = HashSet<GitHash>()
-        walk included excluded wants
+            else
+                newCommits.Add hash
+                for parent in (commitOf hash).Parents do
+                    if not (uninteresting.Contains parent) && interesting.Add parent then
+                        enqueue parent (commitOf parent)
+
+        // Parents before children, so every base tree below is already covered:
+        // by the client, or by this pack. A tree reached a second time is then
+        // skipped safely, because its first walk compared it with covered bases.
+        let newSet = HashSet<GitHash>(newCommits |> Seq.filter (uninteresting.Contains >> not), StringComparer.Ordinal)
+        let newCommits =
+            let ordered = ResizeArray<GitHash>()
+            let visited = HashSet<GitHash>(StringComparer.Ordinal)
+            let stack = Stack<struct (GitHash * bool)>()
+            for start in newSet do
+                stack.Push(struct (start, false))
+                while stack.Count > 0 do
+                    let struct (hash, expanded) = stack.Pop()
+                    if expanded then ordered.Add hash
+                    elif visited.Add hash then
+                        stack.Push(struct (hash, true))
+                        for parent in commits.[hash].Parents do
+                            if newSet.Contains parent && not (visited.Contains parent) then stack.Push(struct (parent, false))
+            ordered.ToArray()
+        // A parent the client has covers its own tree; a new parent's tree is in
+        // the pack by the same rule, applied to that parent first.
+        // A new commit's tree is read again as its child's base. Reads are not
+        // cheap (a large root tree costs tens of milliseconds), so trees are
+        // read once; the cache is dropped when it grows large, as in a clone.
+        let treeCache = Dictionary<GitHash, TreeEntry[]>(StringComparer.Ordinal)
+        let treeEntries (hash: GitHash) =
+            match treeCache.TryGetValue hash with
+            | true, entries -> entries
+            | _ ->
+                let entries =
+                    match read hash (Some "tree") with
+                    | Tree entries -> entries
+                    | _ -> [||]
+                if treeCache.Count >= 65536 then treeCache.Clear()
+                treeCache.[hash] <- entries
+                entries
+        let rec walkChanged (tree: GitHash) (bases: GitHash list) =
+            if not (List.contains tree bases) && included.Add tree then
+                let baseEntries =
+                    bases |> List.map (fun baseTree ->
+                        let byPath = Dictionary<string, TreeEntry>(StringComparer.Ordinal)
+                        for entry in treeEntries baseTree do byPath.[entry.Path] <- entry
+                        byPath)
+                let atPath (entry: TreeEntry) =
+                    baseEntries |> List.choose (fun byPath ->
+                        match byPath.TryGetValue entry.Path with
+                        | true, b -> Some b
+                        | _ -> None)
+                let inBase (entry: TreeEntry) = atPath entry |> List.exists (fun b -> b.Hash = entry.Hash)
+                for entry in treeEntries tree do
+                    if entry.Mode = 0o040000 then
+                        if not (inBase entry) then
+                            let subBases = atPath entry |> List.filter (fun b -> b.Mode = 0o040000) |> List.map _.Hash
+                            walkChanged entry.Hash subBases
+                    elif entry.Mode <> 0o160000 && not (inBase entry) then
+                        included.Add entry.Hash |> ignore
+        for hash in newCommits do
+            included.Add hash |> ignore
+            let commit = commits.[hash]
+            // Every parent is either one the client has or a new commit in this pack.
+            let bases = commit.Parents |> Seq.map (fun parent -> (commitOf parent).Tree) |> List.ofSeq
+            walkChanged commit.Tree bases
+        for tree in wantTrees do walkChanged tree []
         included |> Seq.toArray
+
+    /// Objects to send for `wants` to a complete (non-shallow) client that has `haves`.
+    let objectClosure (repo: Repo) (wants: GitHash[]) (haves: GitHash[]) : GitHash[] =
+        objectClosureFor repo wants haves Seq.empty
 
     /// Depth counts commits, not annotated tags or trees.
     let objectClosureShallow (repo: Repo) (wants: GitHash[]) (depth: int) : GitHash[] * GitHash[] =
