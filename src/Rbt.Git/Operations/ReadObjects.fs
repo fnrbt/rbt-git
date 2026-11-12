@@ -44,11 +44,7 @@ module ReadObjects =
             | Some (t, content) -> parseRaw t content
             | None -> Error $"Object not found: {hash}"
 
-    /// Read an object's exact (typeName, contentBytes) without parsing, so the
-    /// bytes can be re-served or re-packed with an identical hash. Loose objects
-    /// preserve their bytes exactly; packed objects fall back to canonical
-    /// re-serialization (byte-exact for well-formed objects).
-    let readRawObject (repo: Repo) (hash: GitHash) : Result<string * byte[], string> =
+    let private readRawObjectFrom (readPacked: GitHash -> (string * byte[]) option) (repo: Repo) (hash: GitHash) : Result<string * byte[], string> =
         try
             let objectPath = Repository.getLooseObjectPath repo hash
             if File.Exists objectPath then
@@ -67,11 +63,25 @@ module ReadObjects =
                             Error $"Invalid object header or hash: {hash}"
                         else Ok (objType, content)
             else
-                match PackStore.tryRead repo hash with
+                match readPacked hash with
                 | Some raw -> Ok raw
                 | None -> Error $"Object not found: {hash}"
         with ex -> Error $"Failed to read raw object {hash}: {ex.Message}"
-    
+
+    /// Read an object's exact (typeName, contentBytes) without parsing, so the
+    /// bytes can be re-served or re-packed with an identical hash. Loose objects
+    /// preserve their bytes exactly; packed objects fall back to canonical
+    /// re-serialization (byte-exact for well-formed objects). Opens a pack
+    /// session per call; a walk over many objects uses readRawObjectWith.
+    let readRawObject (repo: Repo) (hash: GitHash) : Result<string * byte[], string> =
+        readRawObjectFrom (PackStore.tryRead repo) repo hash
+
+    /// readRawObject through an open pack session, for walks that read many
+    /// objects. A session indexes every packed object when it opens, so a
+    /// session per object made a walk over n packed objects cost O(n^2).
+    let readRawObjectWith (session: PackStore.ReadSession) (repo: Repo) (hash: GitHash) : Result<string * byte[], string> =
+        readRawObjectFrom session.TryRead repo hash
+
     let readBlob (repo: Repo) (hash: GitHash) : Result<byte[], string> =
         match readObject repo hash with
         | Ok (Blob data) -> Ok data

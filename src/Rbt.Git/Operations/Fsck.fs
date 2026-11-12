@@ -43,6 +43,9 @@ module Fsck =
         }
 
     let private verifyReachableCore (repo: Repo) (snapshot: RefSnapshot) =
+        // One pack session for the walk: opening one indexes every packed
+        // object, so a session per object read was quadratic in the pack.
+        use session = new PackStore.ReadSession(repo)
         let issues = ResizeArray<FsckIssue>()
         let visited = HashSet<GitHash>(StringComparer.Ordinal)
         let objectTypes = Dictionary<GitHash, string>(StringComparer.Ordinal)
@@ -61,7 +64,7 @@ module Fsck =
                     issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None $"expected {expected}, found {objectType}")
                 | _ -> ()
             | _ when visited.Add hash ->
-                match ReadObjects.readRawObject repo hash with
+                match ReadObjects.readRawObjectWith session repo hash with
                 | Error error ->
                     issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
                 | Ok (objectType, content) ->
@@ -102,6 +105,7 @@ module Fsck =
         try
             let introduced = HashSet<GitHash>(introducedObjects, StringComparer.Ordinal)
             let tips = updatedTips |> Seq.distinct |> Array.ofSeq
+            use session = new PackStore.ReadSession(repo)
             let issues = ResizeArray<FsckIssue>()
             let checkedObjects = HashSet<GitHash>(StringComparer.Ordinal)
             let objectTypes = Dictionary<GitHash, string>(StringComparer.Ordinal)
@@ -128,7 +132,7 @@ module Fsck =
                     checkExpectedType hash expectedType objectType
                 | false, _ when validate ->
                     checkedObjects.Add hash |> ignore
-                    match ReadObjects.readRawObject repo hash with
+                    match ReadObjects.readRawObjectWith session repo hash with
                     | Error error ->
                         issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
                     | Ok (objectType, content) ->
@@ -146,7 +150,7 @@ module Fsck =
                                 pending.Push(childHash, childType, introduced.Contains childHash)
                 | false, _ ->
                     if checkedObjects.Add hash then
-                        match ReadObjects.readRawObject repo hash with
+                        match ReadObjects.readRawObjectWith session repo hash with
                         | Error error -> issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
                         | Ok (objectType, _) ->
                             objectTypes.[hash] <- objectType
@@ -169,6 +173,8 @@ module Fsck =
         try
             let introduced = HashSet<GitHash>(introducedObjects, StringComparer.Ordinal)
             let tips = updatedTips |> Seq.distinct |> Seq.toArray
+            use baseSession = new PackStore.ReadSession(baseRepo)
+            use quarantineSession = new PackStore.ReadSession(quarantine)
             let issues = ResizeArray<FsckIssue>()
             let checkedObjects = HashSet<GitHash>(StringComparer.Ordinal)
             let types = Dictionary<GitHash, string>(StringComparer.Ordinal)
@@ -185,7 +191,9 @@ module Fsck =
                     | _ -> ()
                 elif checkedObjects.Add hash then
                     let isNew = introduced.Contains hash
-                    let result = ReadObjects.readRawObject (if isNew then quarantine else baseRepo) hash
+                    let result =
+                        if isNew then ReadObjects.readRawObjectWith quarantineSession quarantine hash
+                        else ReadObjects.readRawObjectWith baseSession baseRepo hash
                     match result with
                     | Error error -> issues.Add(issue FsckSeverity.Error FsckIssueKind.Object (Some hash) None error)
                     | Ok (t, content) ->

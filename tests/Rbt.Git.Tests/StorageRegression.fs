@@ -100,6 +100,20 @@ let run () =
         check (not (shallowMerged.Contains history.[1995])) "shallow client closure resent commits above its boundary"
         check (PackWriter.objectClosure fetchRepo [| have |] [| have |] = [||]) "closure of a common tip is not empty"
         check ((PackWriter.objectClosure fetchRepo [| next |] [| String.replicate 40 "2" |] |> Set.ofArray).Contains history.[0]) "closure with an unknown have is incomplete"
+        // Reachable fsck of a packed repository reads through one pack session.
+        // 0.2.1 opened a session (indexing the whole pack) per object, so a
+        // replica check of a 66k-object repository ran for most of an hour.
+        References.writeDirectAtomic fetchRepo "refs/heads/master" merge |> value
+        git fetchRepo.GitDir ["repack"; "-a"; "-d"; "-q"] |> ignore
+        check (Directory.EnumerateFiles(Repository.getPackDir fetchRepo, "*.pack") |> Seq.length = 1) "repack did not produce one pack"
+        let packedSnapshot = References.snapshot fetchRepo RefPolicy.Replication |> value
+        let fsckTimer = Stopwatch.StartNew()
+        let packedReport = Fsck.verifyReachable fetchRepo packedSnapshot |> value
+        fsckTimer.Stop()
+        check packedReport.IsValid (sprintf "packed reachable fsck reported %A" packedReport.Issues)
+        check (packedReport.ObjectsChecked > 8000) (sprintf "packed reachable fsck checked %d objects" packedReport.ObjectsChecked)
+        // Quadratic reads took tens of seconds here; one session takes well under one.
+        check (fsckTimer.Elapsed < TimeSpan.FromSeconds 10.0) (sprintf "packed reachable fsck took %O" fsckTimer.Elapsed)
         let missing = String.replicate 40 "1"
         use output = new MemoryStream()
         let mutable failed = false
