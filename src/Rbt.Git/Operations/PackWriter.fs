@@ -203,6 +203,9 @@ module PackWriter =
 
     /// Depth counts commits, not annotated tags or trees.
     let objectClosureShallow (repo: Repo) (wants: GitHash[]) (depth: int) : GitHash[] * GitHash[] =
+        // One pack session for the walk (see objectClosureFor): a session per
+        // object read made a depth-1 clone of a large tree take minutes.
+        use session = new PackStore.ReadSession(repo)
         let included = HashSet<GitHash>()
         let shallow = HashSet<GitHash>()
         let bestDepth = Dictionary<GitHash, int>()
@@ -216,7 +219,7 @@ module PackWriter =
                 | _ -> bestDepth.[hash] <- d; true
             if shouldVisit then
                 included.Add hash |> ignore
-                match ReadObjects.readObject repo hash with
+                match ReadObjects.readObjectWith session repo hash with
                 | Error error -> failwithf "reading %s: %s" hash error
                 | Ok (Commit commit) ->
                     pending.Enqueue(commit.Tree, d)

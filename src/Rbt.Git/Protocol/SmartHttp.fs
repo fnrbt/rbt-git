@@ -103,13 +103,14 @@ module SmartHttp =
             let seen = System.Collections.Generic.HashSet<GitHash>(StringComparer.Ordinal)
             let pending = System.Collections.Generic.Queue<GitHash * int>()
             for hash in wants do pending.Enqueue(hash, 1)
+            use session = new PackStore.ReadSession(repo)
             let mutable boundary = None
             while pending.Count > 0 && Option.isNone boundary do
                 let hash, distance = pending.Dequeue()
                 if seen.Add hash then
                     if shallow.Contains hash then boundary <- Some distance
                     else
-                        match ReadObjects.readObject repo hash with
+                        match ReadObjects.readObjectWith session repo hash with
                         | Ok (GitObject.Commit commit) ->
                             for parent in commit.Parents do pending.Enqueue(parent, distance + 1)
                         | Ok (GitObject.Tag tag) -> pending.Enqueue(tag.Object, distance)
@@ -392,9 +393,13 @@ module SmartHttp =
                             | Ok written -> introduced <- written
 
                         let introducedSet = System.Collections.Generic.HashSet<GitHash>(introduced, StringComparer.Ordinal)
+                        // The ancestry walk can cover a long history; one pack
+                        // session per repository instead of one per object read.
+                        use repoSession = new PackStore.ReadSession(repo)
+                        use quarantineSession = new PackStore.ReadSession(quarantine)
                         let readObject hash =
-                            if introducedSet.Contains hash then ReadObjects.readObject quarantine hash
-                            else ReadObjects.readObject repo hash
+                            if introducedSet.Contains hash then ReadObjects.readObjectWith quarantineSession quarantine hash
+                            else ReadObjects.readObjectWith repoSession repo hash
 
                         let isAncestor oldSha newSha =
                             let seen = System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
